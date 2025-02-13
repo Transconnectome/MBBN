@@ -951,7 +951,11 @@ class ABCD_fMRI_timeseries(BaseDataset):
         
         if self.fmri_type == 'timeseries':
             y = scipy.stats.zscore(y, axis=1)
-            y = torch.from_numpy(y).T.float()
+            
+            if self.transfer_learning or self.finetune_test:
+                y = F.pad(torch.from_numpy(y), (pad//2, pad//2), "constant", 0).T.float()
+            else:
+                y = torch.from_numpy(y).T.float()
             ans_dict = {'fmri_sequence':y,'subject':subj,'subject_name':subj_name, self.target:target}
 
         elif self.fmri_type == 'frequency':

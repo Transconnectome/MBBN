@@ -103,7 +103,7 @@ def get_arguments(base_path):
     parser.add_argument('--spatial_loss_factor', type=float, default=0.1)
     
     ## ablation
-    parser.add_argument('--ablation', type=str, choices=['convolution', 'no_high_freq'])
+    parser.add_argument('--ablation', type=str, choices=['convolution', 'no_high_freq', 'raw_signal_for_att_conn'])
     
     ## phase 1 vanilla BERT
     parser.add_argument('--task_phase1', type=str, default='vanilla_BERT')

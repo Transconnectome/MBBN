@@ -190,7 +190,7 @@ class Trainer():
         elif self.task.lower() == 'vanilla_bert':
             self.model = Transformer_Finetune(**self.kwargs)
 
-        elif self.task.lower() == 'divfreqbert':
+        elif self.task.lower() == 'mbbn':
             if self.fmri_dividing_type == 'three_channels':
                 self.model = Transformer_Finetune_Three_Channels(**self.kwargs)
          
@@ -404,7 +404,10 @@ class Trainer():
         ###### test ######
         if self.task.lower() == 'test':
             if self.fmri_type in ['timeseries', 'frequency', 'time_domain_high', 'time_domain_low', 'time_domain_ultralow', 'frequency_domain_low', 'frequency_domain_ultralow', 'frequency_domain_high']:
-                output_dict = self.model(input_dict['fmri_sequence'])
+                if self.ablation == 'raw_signal_for_att_conn':
+                    output_dict = self.model(input_dict['fmri_sequence'], input_dict['fmri_sequence'], input_dict['fmri_sequence'])
+                else:
+                    output_dict = self.model(input_dict['fmri_sequence'])
             elif self.fmri_type == 'divided_timeseries':
                 if self.fmri_dividing_type == 'two_channels':
                     output_dict = self.model(input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
@@ -415,7 +418,10 @@ class Trainer():
         #### train & valid ####
         else:
             if self.fmri_type in ['timeseries', 'frequency', 'time_domain_high', 'time_domain_low', 'time_domain_ultralow', 'frequency_domain_low', 'frequency_domain_ultralow', 'frequency_domain_high']:
-                output_dict = self.model(input_dict['fmri_sequence'])
+                if self.ablation == 'raw_signal_for_att_conn':
+                    output_dict = self.model(input_dict['fmri_sequence'], input_dict['fmri_sequence'], input_dict['fmri_sequence'])
+                else:
+                    output_dict = self.model(input_dict['fmri_sequence'])
             elif self.fmri_type == 'divided_timeseries':
                 if self.fmri_dividing_type == 'two_channels':
                     output_dict = self.model(input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
@@ -426,7 +432,7 @@ class Trainer():
         torch.cuda.nvtx.range_push("aggregate_losses")
         loss_dict, loss = self.aggregate_losses(input_dict, output_dict)
         torch.cuda.nvtx.range_pop()
-        if self.task.lower() in ['vanilla_bert', 'divfreqbert', 'test']:
+        if self.task.lower() in ['vanilla_bert', 'mbbn', 'test']:
             if self.target != 'reconstruction':
                 self.compute_accuracy(input_dict, output_dict)
         return loss_dict, loss
