@@ -3,6 +3,7 @@ import pandas as pd
 import scipy.io
 import random
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -16,8 +17,7 @@ from scipy import stats
 import torch.nn.functional as F
 import nitime
 from scipy.optimize import curve_fit
-
-import pickle
+from lmfit import Model
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -27,12 +27,27 @@ from nitime.timeseries import TimeSeries
 
 # Import the analysis objects:
 from nitime.analysis import SpectralAnalyzer, FilterAnalyzer, NormalizationAnalyzer
-
+'''
 def lorentzian_function(x, s0, corner):
     return (s0*corner**2) / (x**2 + corner**2)
 
+    
 def multi_fractal_function(x, beta_low, beta_high, A, B, corner):
     return np.where(x < corner, A * x**beta_low, B * x**beta_high)
+'''
+def lorentzian_function(x, s0, f1):
+     return (s0*f1**2) / (x**2 + f1**2)
+    
+def spline_multifractal(x, beta_low, beta_high, A, f2, smoothness):
+    log_x = np.log(x)
+    log_f2 = np.log(f2)
+    
+    # cubic spline transition
+    w = np.where(log_x < log_f2 - smoothness, 0,
+         np.where(log_x > log_f2 + smoothness, 1,
+         0.5 * (1 - np.cos(np.pi * (log_x - log_f2 + smoothness)/(2*smoothness)))))
+    
+    return A * x**(beta_low * (1-w) + beta_high * w)
 
 class BaseDataset(Dataset):
     def __init__(self):
@@ -177,14 +192,13 @@ class ABIDE_fMRI_timeseries(BaseDataset):
         else:
             TR = 3 # ABIDE 2
 
-
         if self.lorentzian:
         
             '''
             get knee frequency
             '''
 
-            sample_whole = np.zeros(self.sequence_length,) # originally self.sequence_length.
+            sample_whole = np.zeros(self.sequence_length,)
             for i in range(self.intermediate_vec):
                 sample_whole+=y[i]
 
@@ -192,17 +206,39 @@ class ABIDE_fMRI_timeseries(BaseDataset):
 
             T = TimeSeries(sample_whole, sampling_interval=TR)
             S_original = SpectralAnalyzer(T)
-
-            # Lorentzian function fitting (dividing ultralow ~ low)
+            
             xdata = np.array(S_original.spectrum_fourier[0][1:])
             ydata = np.abs(S_original.spectrum_fourier[1][1:])
 
-            # initial parameter setting
-            p0 = [0, 0.006]
-            param_bounds = ([-np.inf, 0], [np.inf, 1])
+            
+            # lmfit model setting
+            model = Model(lorentzian_function)
+            params = model.make_params()
 
-            # fitting Lorentzian function
-            popt, pcov = curve_fit(lorentzian_function, xdata, ydata, p0=p0, maxfev = 5000, bounds=param_bounds)
+            # Parameter initialization
+            params['s0'].set(value=900, min=0.0, max=1200.0)
+            params['f1'].set(value=0.05, min=0.01, max=0.1)
+
+            # Fitting
+            result = model.fit(ydata, params, x=xdata,
+                               method='differential_evolution',
+                               max_nfev=20000)
+
+            f1 = result.params['f1'].value
+            
+            knee = round(f1/(1/(sample_whole.shape[0]*TR)))
+
+            if knee <= 0:
+                knee = 1
+                
+            
+            
+            '''
+            # initialize parameters
+            p0 = [0, 0.006]
+
+            # Lorentzian function fitting
+            popt, pcov = curve_fit(lorentzian_function, xdata, ydata, p0=p0, maxfev = 5000)
             
             f1 = popt[1]
             
@@ -210,16 +246,35 @@ class ABIDE_fMRI_timeseries(BaseDataset):
             
             if knee <= 0:
                 knee = 1
+            '''
             
-            # divide low ~ high
             if self.fmri_dividing_type == 'three_channels':
-                # initial parameter setting
+                # lmfit 모델 설정
+                model = Model(spline_multifractal)
+                params = model.make_params()
+
+                # 파라미터 초기값과 제한 설정
+                params['beta_low'].set(value=-1.2, min=-5, max=-0.1)  # 초기값을 현재 피팅 결과값에 가깝게
+                params['beta_high'].set(value=-0.5, min=-5, max=-0.1)
+                params['A'].set(value=10, min=1, max=30) 
+                params['f2'].set(value=0.08, min=f1+0.001, max=0.2)  # 현재 피팅된 값 근처로 초기값 조정
+                params['smoothness'].set(value=0.25, min=0.001, max=1.0)  # 초기값을 현재 피팅 결과값으로
+
+                # Fitting 실행
+                result = model.fit(ydata[knee:], params, x=xdata[knee:],
+                           method='differential_evolution',
+                           max_nfev=20000)
+                f2 = result.params['f2'].value
+                pink = round(f2/(1/(sample_whole.shape[0]*TR)))
+                '''
+                # initialize parameters
                 p1 = [2, 1, 23, 25, 0.16]
                 
-                # fitting multifractal function
+                # multi-fractal function fitting
                 popt_mo, pcov = curve_fit(multi_fractal_function, xdata[knee:], ydata[knee:], p0=p1, maxfev = 50000)
                 pink = round(popt_mo[-1]/(1/(sample_whole.shape[0]*TR)))
                 f2 = popt_mo[-1]
+                '''
 
         # don't use Lorentzian function to divide frequencies
         else:
@@ -544,15 +599,38 @@ class UKB_fMRI_timeseries(BaseDataset):
 
             T = TimeSeries(sample_whole, sampling_interval=TR)
             S_original = SpectralAnalyzer(T)
-
-            # Lorentzian function fitting
+            
             xdata = np.array(S_original.spectrum_fourier[0][1:])
             ydata = np.abs(S_original.spectrum_fourier[1][1:])
 
-            # initial parameter
+            
+            # lmfit model setting
+            model = Model(lorentzian_function)
+            params = model.make_params()
+
+            # Parameter initialization
+            params['s0'].set(value=900, min=0.0, max=1200.0)
+            params['f1'].set(value=0.05, min=0.01, max=0.1)
+
+            # Fitting
+            result = model.fit(ydata, params, x=xdata,
+                               method='differential_evolution',
+                               max_nfev=20000)
+
+            f1 = result.params['f1'].value
+            
+            knee = round(f1/(1/(sample_whole.shape[0]*TR)))
+
+            if knee <= 0:
+                knee = 1
+                
+            
+            
+            '''
+            # initialize parameters
             p0 = [0, 0.006]
 
-            # fitting Lorentzian function
+            # Lorentzian function fitting
             popt, pcov = curve_fit(lorentzian_function, xdata, ydata, p0=p0, maxfev = 5000)
             
             f1 = popt[1]
@@ -561,15 +639,35 @@ class UKB_fMRI_timeseries(BaseDataset):
             
             if knee <= 0:
                 knee = 1
-            
+            '''
             
             if self.fmri_dividing_type == 'three_channels':
-                # initial parameter
+                # lmfit 모델 설정
+                model = Model(spline_multifractal)
+                params = model.make_params()
+
+                # 파라미터 초기값과 제한 설정
+                params['beta_low'].set(value=-1.2, min=-5, max=-0.1)  # 초기값을 현재 피팅 결과값에 가깝게
+                params['beta_high'].set(value=-0.5, min=-5, max=-0.1)
+                params['A'].set(value=10, min=1, max=30) 
+                params['f2'].set(value=0.08, min=f1+0.001, max=0.2)  # 현재 피팅된 값 근처로 초기값 조정
+                params['smoothness'].set(value=0.25, min=0.001, max=1.0)  # 초기값을 현재 피팅 결과값으로
+
+                # Fitting 실행
+                result = model.fit(ydata[knee:], params, x=xdata[knee:],
+                           method='differential_evolution',
+                           max_nfev=20000)
+                f2 = result.params['f2'].value
+                pink = round(f2/(1/(sample_whole.shape[0]*TR)))
+                '''
+                # initialize parameters
                 p1 = [2, 1, 23, 25, 0.16]
-                # fitting multifractal function
+                
+                # multi-fractal function fitting
                 popt_mo, pcov = curve_fit(multi_fractal_function, xdata[knee:], ydata[knee:], p0=p1, maxfev = 50000)
                 pink = round(popt_mo[-1]/(1/(sample_whole.shape[0]*TR)))
                 f2 = popt_mo[-1]
+                '''
 
         else:
             if self.fmri_type == 'timeseries':
@@ -864,12 +962,13 @@ class ABCD_fMRI_timeseries(BaseDataset):
     
         
     def __getitem__(self, index):
+        print(f"Attempting to access item {index}")
+        
         subj, subj_name, path_to_fMRIs, target = self.index_l[index]
         if self.seq_part=='tail':
             y = np.load(path_to_fMRIs)[-self.sequence_length:].T # [180, seq_len]
         elif self.seq_part=='head':
             y = np.load(path_to_fMRIs)[:self.sequence_length].T # [180, seq_len]
-        
         if self.transfer_learning or self.finetune_test:
             # pad to 464 (I pretrained my model with UKB)
             pad = 464 - self.sequence_length
@@ -893,29 +992,45 @@ class ABCD_fMRI_timeseries(BaseDataset):
             xdata = np.array(S_original.spectrum_fourier[0][1:])
             ydata = np.abs(S_original.spectrum_fourier[1][1:])
 
-            # initialize parameters
-            p0 = [0, 0.006]
+            
+            # lmfit model setting
+            model = Model(lorentzian_function)
+            params = model.make_params()
 
-            # Lorentzian function fitting
-            popt, pcov = curve_fit(lorentzian_function, xdata, ydata, p0=p0, maxfev = 5000)
+            # Parameter initialization
+            params['s0'].set(value=1.0, min=0.0, max=15.0)
+            params['f1'].set(value=0.05, min=0.01, max=0.1)
+
+            # Fitting
+            result = model.fit(ydata, params, x=xdata,
+                               method='differential_evolution',
+                               max_nfev=20000)
+
+            f1 = result.params['f1'].value
             
-            f1 = popt[1]
-            
-            knee = round(popt[1]/(1/(sample_whole.shape[0]*TR)))
-            
+            knee = round(f1/(1/(sample_whole.shape[0]*TR)))
+
             if knee <= 0:
                 knee = 1
             
-            
             if self.fmri_dividing_type == 'three_channels':
-                # initialize parameters
-                p1 = [2, 1, 23, 25, 0.16]
-                
-                # multi-fractal function fitting
-                popt_mo, pcov = curve_fit(multi_fractal_function, xdata[knee:], ydata[knee:], p0=p1, maxfev = 50000)
-                pink = round(popt_mo[-1]/(1/(sample_whole.shape[0]*TR)))
-                f2 = popt_mo[-1]
+                # lmfit 모델 설정
+                model = Model(spline_multifractal)
+                params = model.make_params()
 
+                # 파라미터 초기값과 제한 설정
+                params['beta_low'].set(value=-0.2, min=-2, max=-0.01)
+                params['beta_high'].set(value=-0.2, min=-0.5, max=-0.01)  # 반드시 음수가 되도록
+                params['A'].set(value=0.2, min=0.1, max=1.0)
+                params['f2'].set(value=0.1, min=f1+0.001, max=0.1)
+                params['smoothness'].set(value=0.01, min=0.001, max=1.0)
+
+                # Fitting 실행
+                result = model.fit(ydata[knee:], params, x=xdata[knee:],
+                           method='differential_evolution',
+                           max_nfev=20000)
+                f2 = result.params['f2'].value
+                pink = round(f2/(1/(sample_whole.shape[0]*TR)))
 
 
         else:
@@ -1060,8 +1175,12 @@ class ABCD_fMRI_timeseries(BaseDataset):
                     FA1 = FilterAnalyzer(T1, lb = f2)
                 else:
                     FA1 = FilterAnalyzer(T1, lb = S_original1.spectrum_fourier[0][pink])
-                high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
-                ultralow_low = FA1.data-FA1.filtered_boxcar.data
+                if self.filtering_type == 'FIR':
+                    high = stats.zscore(FA1.fir.data, axis=1)
+                    ultralow_low = FA1.data-FA1.fir.data                    
+                elif self.filtering_type == 'Boxcar':
+                    high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
+                    ultralow_low = FA1.data-FA1.filtered_boxcar.data
                     
                 # 02 low ~ ultralow 뜯어내기
                 T2 = TimeSeries(ultralow_low, sampling_interval=TR)

@@ -95,6 +95,8 @@ class BaseModel(nn.Module, ABC):
     def register_vars(self,**kwargs):
         self.intermediate_vec = kwargs.get('intermediate_vec') # embedding size(h) 
         self.spatiotemporal = kwargs.get('spatiotemporal')
+        self.spatial = kwargs.get('spatial')
+        self.temporal = kwargs.get('temporal')
         self.transformer_dropout_rate = kwargs.get('transformer_dropout_rate')
         self.sequence_length = kwargs.get('sequence_length')
         self.pretrained_model_weights_path = kwargs.get('pretrained_model_weights_path')
@@ -294,9 +296,10 @@ class Transformer_Finetune_Three_Channels(BaseModel):
             self.cnn = nn.Conv1d(self.sequence_length, self.sequence_length, 3, stride=1, padding=1)            
                 
         if self.spatiotemporal:
+            # temporal
             self.transformer = Transformer_Block(self.BertConfig, **kwargs).to(memory_format=torch.channels_last_3d)
             
-            # num attention heads
+            # spatial
             if self.sequence_length % 12 == 0:
                 num_heads = 12 # 36
             elif self.sequence_length % 8 == 0:
@@ -305,12 +308,29 @@ class Transformer_Finetune_Three_Channels(BaseModel):
             self.low_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
             self.ultralow_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
             
-        else:
-            # temporal #
+            # classifier
+            self.regression_head = Classifier(self.intermediate_vec, self.label_num)
+            
+        elif self.temporal:
+            # temporal
             self.transformer = Transformer_Block(self.BertConfig, **kwargs).to(memory_format=torch.channels_last_3d)
+            
+            # classifier
+            self.regression_head = Classifier(self.intermediate_vec, self.label_num)
+            
+        elif self.spatial:
+            # spatial
+            if self.sequence_length % 12 == 0:
+                num_heads = 12 # 36
+            elif self.sequence_length % 8 == 0:
+                num_heads = 8
+            self.high_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
+            self.low_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
+            self.ultralow_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
         
-        # classifier setting
-        self.regression_head = Classifier(self.intermediate_vec, self.label_num)
+            # classifier
+            self.regression_head = Classifier(self.intermediate_vec*self.intermediate_vec, self.label_num)
+        
             
     def forward(self, x_h, x_l, x_u):
         # input shape : (batch, seq_len, ROI)
@@ -327,26 +347,35 @@ class Transformer_Finetune_Three_Channels(BaseModel):
             transformer_dict_high = self.transformer(x_h)
             transformer_dict_low = self.transformer(x_l)
             transformer_dict_ultralow = self.transformer(x_u)
-            
             # spatial
             high_spatial_attention = self.high_spatial_attention(x_h.permute(0, 2, 1)) # (batch, ROI, sequence length)
-            low_spatial_attention = self.low_spatial_attention(x_h.permute(0, 2, 1)) # (batch, ROI, sequence length)
-            ultralow_spatial_attention = self.ultralow_spatial_attention(x_h.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            low_spatial_attention = self.low_spatial_attention(x_l.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            ultralow_spatial_attention = self.ultralow_spatial_attention(x_u.permute(0, 2, 1)) # (batch, ROI, sequence length)
             # desired output shape : (batch, num_heads, ROI, ROI)
         
             
-        else:
-            # temporal #
+        elif self.temporal:
             transformer_dict_high = self.transformer(x_h)
             transformer_dict_low = self.transformer(x_l)
             transformer_dict_ultralow = self.transformer(x_u)
-            
+        
+        elif self.spatial:
+            high_spatial_attention = self.high_spatial_attention(x_h.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            low_spatial_attention = self.low_spatial_attention(x_l.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            ultralow_spatial_attention = self.ultralow_spatial_attention(x_u.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            # desired output shape : (batch, num_heads, ROI, ROI)
 
         # 02 get pooled_cls
-        out_cls_high = transformer_dict_high['cls']
-        out_cls_low = transformer_dict_low['cls']
-        out_cls_ultralow = transformer_dict_ultralow['cls']
-
+        if not self.spatial:
+            out_cls_high = transformer_dict_high['cls']
+            out_cls_low = transformer_dict_low['cls']
+            out_cls_ultralow = transformer_dict_ultralow['cls']
+        else:
+            batch_size = high_spatial_attention.shape[0]
+            out_cls_high = torch.mean(high_spatial_attention, dim=1).reshape(batch_size, -1)
+            out_cls_low = torch.mean(low_spatial_attention, dim=1).reshape(batch_size, -1)
+            out_cls_ultralow = torch.mean(ultralow_spatial_attention, dim=1).reshape(batch_size, -1)
+            
         pred_high = self.regression_head(out_cls_high)
         pred_low = self.regression_head(out_cls_low)
         pred_ultralow = self.regression_head(out_cls_ultralow)
@@ -357,7 +386,7 @@ class Transformer_Finetune_Three_Channels(BaseModel):
         if self.visualization:
             ans_dict = prediction
         else:
-            if self.spatiotemporal:
+            if self.spatiotemporal or self.spatial:
                 ans_dict = {self.task:prediction, 'high_spatial_attention':high_spatial_attention, 'low_spatial_attention':low_spatial_attention, 'ultralow_spatial_attention':ultralow_spatial_attention}
             else:
                 ans_dict = {self.task:prediction}

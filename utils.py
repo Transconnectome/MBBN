@@ -86,7 +86,7 @@ def weight_loader(args):
             if os.path.exists(args.model_weights_path_ABCD):
                 model_weights_path = args.model_weights_path_ABCD
         elif args.step == '2':
-            task = 'divfreqBERT'
+            task = 'MBBN'
             if os.path.exists(args.model_weights_path_ABCD):
                 model_weights_path = args.model_weights_path_ABCD
         elif args.step == '3' :

@@ -341,12 +341,19 @@ class DataHandler():
         cuda = kwargs.get('cuda')
         #if eval:
         #    workers = 0
+        '''
         params = {'batch_size': batch_size,
                   #'shuffle': True,
                   'num_workers': workers,
                   'drop_last': True,
                   'pin_memory': True,  # True if cuda else False,
                   'persistent_workers': True if workers > 0 and cuda else False}
+      '''
+        params = {'batch_size': batch_size,
+                  'num_workers': workers,
+                  'drop_last': False,
+                  'pin_memory': False,
+                  'persistent_workers': False}
         
         return params
 

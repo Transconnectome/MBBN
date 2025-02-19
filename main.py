@@ -31,7 +31,9 @@ def get_arguments(base_path):
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--visualization', action='store_true')
     parser.add_argument('--prepare_visualization', action='store_true')
+    parser.add_argument('--flop_counter', action='store_true')
     parser.add_argument('--weightwatcher', action='store_true')
+    parser.add_argument('--profiling', action='store_true')
     parser.add_argument('--weightwatcher_save_dir', default=None)
 
     
@@ -62,9 +64,6 @@ def get_arguments(base_path):
     
     # Gradient accumulation
     parser.add_argument("--accumulation_steps", default=1, type=int,required=False,help='mini batch size == accumulation_steps * args.train_batch_size')
-    
-    # Nsight profiling
-    parser.add_argument("--profiling", action='store_true')
     
     #wandb related
     parser.add_argument('--wandb_key', default='108101f4b9c3e31a235aa58307d1c6b548cfb54a', type=str,  help='default: key for Stella')
@@ -99,6 +98,8 @@ def get_arguments(base_path):
     
     ## spatiotemporal
     parser.add_argument('--spatiotemporal', action = 'store_true')
+    parser.add_argument('--spatial', action = 'store_true') # ablation
+    parser.add_argument('--temporal', action = 'store_true') # ablation
     parser.add_argument('--spat_diff_loss_type', type=str, default='minus_log', choices=['minus_log', 'reciprocal_log', 'exp_minus', 'log_loss', 'exp_whole'])
     parser.add_argument('--spatial_loss_factor', type=float, default=0.1)
     
@@ -245,7 +246,31 @@ if __name__ == '__main__':
     base_path = os.getcwd() 
     setup_folders(base_path) 
     args = get_arguments(base_path)
-
+    
+    import os, psutil, resource
+    process = psutil.Process(os.getpid())
+    print(f"Current process status: {process.status()}")
+    
+    # 자식 프로세스들의 상태도 확인
+    children = process.children(recursive=True)
+    for child in children:
+        try:
+            print(f"Child process {child.pid} status: {child.status()}")
+        except psutil.NoSuchProcess:
+            print(f"Child process {child.pid} no longer exists")
+            
+    # 좀비 프로세스 확인
+    zombies = [p for p in children if p.status() == psutil.STATUS_ZOMBIE]
+    print(f"Number of zombie processes: {len(zombies)}")
+    
+    print(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+    print(f"Number of threads: {process.num_threads()}")
+    print(f"Open files: {len(process.open_files())}")
+    print("Process status:", process.status())
+    print("CPU affinity:", process.cpu_affinity())
+    print("IO counters:", process.io_counters())
+    print(f"Current file descriptors: {resource.getrlimit(resource.RLIMIT_NOFILE)}")
+    
     # DDP initialization
     init_distributed(args)
 

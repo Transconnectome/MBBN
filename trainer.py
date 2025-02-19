@@ -9,10 +9,13 @@ from model import *
 import time
 import pathlib
 import os
-
+import sys
+from flop_counter import *
 
 from torch.nn import MSELoss,L1Loss,BCELoss, BCEWithLogitsLoss, Sigmoid
 
+# profling
+from torch.profiler import profile, record_function, ProfilerActivity
 
 #DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -59,12 +62,18 @@ class Trainer():
         self.pretrained_model_weights_path = kwargs.get('pretrained_model_weights_path')
         self.exp_name = kwargs.get('exp_name')
         self.weightwatcher_save_dir = kwargs.get('weightwatcher_save_dir')
+        # flop stuffs
+        self.flop_counter = kwargs.get('flop_counter')
+        # profiling
+        self.profiling = kwargs.get('profiling')
         
         if not self.weightwatcher:
+            print("Creating DataLoader...")
             if self.fine_tune_task == 'regression':
                 self.train_loader, self.val_loader, self.test_loader, self.mean, self.std = DataHandler(**kwargs).create_dataloaders()
             else:
                 self.train_loader, self.val_loader, self.test_loader = DataHandler(**kwargs).create_dataloaders()
+            print("DataLoader created successfully")
             
         self.lr_handler = LrHandler(self.train_loader, **kwargs)
                 
@@ -262,7 +271,6 @@ class Trainer():
                 pad_inches=0.1,
                 metadata=None)
             sys.exit()
-
         
         if self.profiling == True:
             self.nEpochs = 1
@@ -350,6 +358,49 @@ class Trainer():
             print("no cuda device")
 
         times = []
+        print("Starting iteration...")
+        if self.profiling:
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                for batch_idx, input_dict in enumerate(tqdm(self.train_loader,position=0,leave=True)): 
+                    if batch_idx > 10:  # 처음 10개 배치만
+                        sys.exit()
+                    ### training ###
+                    #start_time = time.time()
+                    torch.cuda.nvtx.range_push("training steps")
+                    self.writer.total_train_steps += 1
+                    self.optimizer.zero_grad()
+                    if self.amp:
+                        torch.cuda.nvtx.range_push("forward pass")
+                        with autocast():
+                            loss_dict, loss = self.forward_pass(input_dict)
+                        torch.cuda.nvtx.range_pop()
+                        loss = loss / self.accumulation_steps # gradient accumulation
+                        torch.cuda.nvtx.range_push("backward pass")
+                        self.scaler.scale(loss).backward()
+                        torch.cuda.nvtx.range_pop()
+
+                        if  (batch_idx + 1) % self.accumulation_steps == 0: # gradient accumulation
+                            # gradient clipping 
+                            if self.gradient_clipping == True:
+                                self.scaler.unscale_(self.optimizer)
+                                # print('executing gradient clipping')
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1, error_if_nonfinite=False)
+
+                            self.scaler.step(self.optimizer)
+                            scale = self.scaler.get_scale()
+                            self.scaler.update()
+                            skip_lr_sched = (scale > self.scaler.get_scale())
+                        if not skip_lr_sched:
+                            self.lr_handler.schedule_check_and_update(self.optimizer) 
+                    else:
+                        loss_dict, loss = self.forward_pass(input_dict)
+                        loss.backward()
+                        self.optimizer.step()
+                        self.lr_handler.schedule_check_and_update(self.optimizer)
+
+                    self.writer.write_losses(loss_dict, set='train')
+                    torch.cuda.empty_cache()
+            
         for batch_idx, input_dict in enumerate(tqdm(self.train_loader,position=0,leave=True)): 
             ### training ###
             #start_time = time.time()
@@ -386,6 +437,7 @@ class Trainer():
                 self.lr_handler.schedule_check_and_update(self.optimizer)
                 
             self.writer.write_losses(loss_dict, set='train')
+            torch.cuda.empty_cache()
                 
     def eval_epoch(self,set):
         loader = self.val_loader if set == 'val' else self.test_loader
@@ -418,11 +470,19 @@ class Trainer():
         #### train & valid ####
         else:
             if self.fmri_type in ['timeseries', 'frequency', 'time_domain_high', 'time_domain_low', 'time_domain_ultralow', 'frequency_domain_low', 'frequency_domain_ultralow', 'frequency_domain_high']:
+                if self.flop_counter:
+                    input_size = input_dict['fmri_sequence'].shape
+                    print('flop is', calculate_model_flops(self.model, input_size, 'vanilla_BERT'))
+                    sys.exit()
                 if self.ablation == 'raw_signal_for_att_conn':
                     output_dict = self.model(input_dict['fmri_sequence'], input_dict['fmri_sequence'], input_dict['fmri_sequence'])
                 else:
                     output_dict = self.model(input_dict['fmri_sequence'])
             elif self.fmri_type == 'divided_timeseries':
+                if self.flop_counter:
+                    input_size = input_dict['fmri_highfreq_sequence'].shape
+                    print('flop is', calculate_model_flops(self.model, input_size, 'mbbn'))
+                    sys.exit()
                 if self.fmri_dividing_type == 'two_channels':
                     output_dict = self.model(input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
                 elif self.fmri_dividing_type == 'three_channels':
