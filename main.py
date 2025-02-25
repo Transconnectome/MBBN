@@ -55,10 +55,10 @@ def get_arguments(base_path):
     parser.add_argument('--dist_backend', default='nccl', type=str, 
                         help='distributed backend')
     parser.add_argument('--init_method', default='file', type=str, choices=['file','env'], help='DDP init method')
-    parser.add_argument('--distributed', default=True)
+    parser.add_argument('--distributed', action='store_true')
 
     # AMP configs:
-    parser.add_argument('--amp', action='store_false')
+    parser.add_argument('--amp', action='store_false', help='if true, do not use amp')
     parser.add_argument('--gradient_clipping', action='store_true')
     parser.add_argument('--clip_max_norm', type=float, default=1.0)
     
@@ -73,7 +73,7 @@ def get_arguments(base_path):
 
     
     # dividing
-    parser.add_argument('--filtering_type', default='Boxcar', choices=['FIR', 'Boxcar'])
+    parser.add_argument('--filtering_type', default='Boxcar', choices=['FIR', 'Boxcar', 'IIR', 'mixture'])
     parser.add_argument('--use_high_freq', action='store_true')
     parser.add_argument('--divide_by_lorentzian', action='store_true')
     parser.add_argument('--use_raw_knee', action='store_true')
@@ -104,7 +104,7 @@ def get_arguments(base_path):
     parser.add_argument('--spatial_loss_factor', type=float, default=0.1)
     
     ## ablation
-    parser.add_argument('--ablation', type=str, choices=['convolution', 'no_high_freq', 'raw_signal_for_att_conn'])
+    parser.add_argument('--ablation', type=str, choices=['convolution', 'FC'])
     
     ## phase 1 vanilla BERT
     parser.add_argument('--task_phase1', type=str, default='vanilla_BERT')
@@ -243,6 +243,7 @@ def test(args,phase_num,model_weights_path):
     trainer.testing()
 
 if __name__ == '__main__':
+    print('num of core', os.cpu_count())
     base_path = os.getcwd() 
     setup_folders(base_path) 
     args = get_arguments(base_path)

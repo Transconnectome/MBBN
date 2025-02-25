@@ -140,17 +140,20 @@ args = get_arguments()
 model_path = args.model_path
 dataset_name = args.dataset_name
 model = Transformer_Finetune_Three_Channels(**vars(args))
-state_dict = torch.load(model_path)['model_state_dict']
+state_dict = torch.load(model_path, weights_only=False)['model_state_dict']
 model.load_state_dict(state_dict)
 model.eval()
 model.cuda(0) if torch.cuda.is_available() else model
 
-if dataset_name == 'ABIDE':
-    lower_bound = 0.45
-    upper_bound = 0.55
-elif dataset_name == 'ABCD':
-    lower_bound = 0.75
-    upper_bound = 0.25
+lower_bound = 1
+upper_bound = 0
+    
+# if dataset_name == 'ABIDE':
+#     lower_bound = 0.45
+#     upper_bound = 0.55
+# elif dataset_name == 'ABCD':
+#     lower_bound = 0.25
+#     upper_bound = 0.75
     
 def get_activation(dict, name):
     def hook(model, input, output):

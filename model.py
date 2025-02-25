@@ -230,6 +230,15 @@ class Transformer_Finetune(BaseModel):
         self.register_vars(**kwargs)
         self.transformer = Transformer_Block(self.BertConfig, **kwargs).to(memory_format=torch.channels_last_3d)
         self.regression_head = nn.Linear(self.intermediate_vec, self.label_num) #.to(memory_format=torch.channels_last_3d)
+        
+        if self.spatiotemporal:
+            if self.sequence_length % 12 == 0:
+                num_heads = 12 # 36
+            elif self.sequence_length % 8 == 0:
+                num_heads = 8
+
+            self.spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
+            self.regression_head_spatial = Classifier(self.intermediate_vec*self.intermediate_vec, self.label_num)
 
     def forward(self, x):
          # x is (batch size, seq len, ROI)
@@ -241,11 +250,27 @@ class Transformer_Finetune(BaseModel):
         size of out cls is: (batch, ROI)
         size of prediction is: (batch, label_num)
         '''
+        
+        if self.spatiotemporal:
+            # spatial
+            spatial_attention = self.spatial_attention(x.permute(0, 2, 1)) # (batch, ROI, sequence length)
+            # desired output shape : (batch, num_heads, ROI, ROI)
+            batch_size = spatial_attention.shape[0]
+            out_cls_spatial = torch.mean(spatial_attention, dim=1).reshape(batch_size, -1)
+            pred_spatial = self.regression_head_spatial(out_cls_spatial)
+            
         out_seq = transformer_dict['sequence']
         out_cls = transformer_dict['cls']
-        prediction = self.regression_head(out_cls)
+        pred_temporal = self.regression_head(out_cls)
         
-        return {self.task:prediction}
+        prediction = (pred_spatial+pred_temporal)/2
+        
+        if self.spatiotemporal:
+            ans_dict = {self.task:prediction, 'spatial_attention':spatial_attention}
+        else:
+            ans_dict = {self.task:prediction}
+            
+        return ans_dict
     
 # ablation study 2 - two frequency version (no high freq)
 class Transformer_Finetune_Two_Channels(BaseModel):
@@ -259,7 +284,6 @@ class Transformer_Finetune_Two_Channels(BaseModel):
         elif self.sequence_length % 8 == 0:
             num_heads = 8
 
-        self.high_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
         self.low_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
         self.ultralow_spatial_attention = Attention(dim=self.sequence_length, num_heads=num_heads)
         self.regression_head = Classifier(self.intermediate_vec, self.label_num)
@@ -294,7 +318,9 @@ class Transformer_Finetune_Three_Channels(BaseModel):
 
         if self.ablation == 'convolution':
             self.cnn = nn.Conv1d(self.sequence_length, self.sequence_length, 3, stride=1, padding=1)            
-                
+        elif self.ablation == 'FC':
+            self.regression_head = Classifier(self.intermediate_vec*self.intermediate_vec, self.label_num)
+            
         if self.spatiotemporal:
             # temporal
             self.transformer = Transformer_Block(self.BertConfig, **kwargs).to(memory_format=torch.channels_last_3d)
@@ -340,7 +366,22 @@ class Transformer_Finetune_Three_Channels(BaseModel):
             x_h = self.cnn(x_h)
             x_l = self.cnn(x_l)
             x_u = self.cnn(x_u)
+        
+        elif self.ablation == 'FC':
+            def compute_correlation_matrix(x):
+                x = x - x.mean(dim=1, keepdim=True)  # (batch, seq_len, ROI)
+                cov_matrix = torch.matmul(x.transpose(1, 2), x) / (x.shape[1] - 1)  # (batch, ROI, ROI)
+                std_dev = torch.sqrt(torch.diagonal(cov_matrix, dim1=1, dim2=2).unsqueeze(-1))  # (batch, ROI, 1)
+                corr_matrix = cov_matrix / (std_dev * std_dev.transpose(1, 2) + 1e-8)  # (batch, ROI, ROI)
 
+                return corr_matrix
+
+
+            pred_high = self.regression_head(compute_correlation_matrix(x_h).reshape(-1, self.intermediate_vec*self.intermediate_vec))
+            pred_low = self.regression_head(compute_correlation_matrix(x_l).reshape(-1, self.intermediate_vec*self.intermediate_vec))
+            pred_ultralow = self.regression_head(compute_correlation_matrix(x_u).reshape(-1, self.intermediate_vec*self.intermediate_vec))
+        
+            
         # 01 get dict
         if self.spatiotemporal:       
             # temporal
@@ -366,19 +407,24 @@ class Transformer_Finetune_Three_Channels(BaseModel):
             # desired output shape : (batch, num_heads, ROI, ROI)
 
         # 02 get pooled_cls
-        if not self.spatial:
+        if self.spatiotemporal or self.temporal: 
             out_cls_high = transformer_dict_high['cls']
             out_cls_low = transformer_dict_low['cls']
             out_cls_ultralow = transformer_dict_ultralow['cls']
-        else:
+            
+            pred_high = self.regression_head(out_cls_high)
+            pred_low = self.regression_head(out_cls_low)
+            pred_ultralow = self.regression_head(out_cls_ultralow)
+        
+        elif self.spatial:
             batch_size = high_spatial_attention.shape[0]
             out_cls_high = torch.mean(high_spatial_attention, dim=1).reshape(batch_size, -1)
             out_cls_low = torch.mean(low_spatial_attention, dim=1).reshape(batch_size, -1)
             out_cls_ultralow = torch.mean(ultralow_spatial_attention, dim=1).reshape(batch_size, -1)
             
-        pred_high = self.regression_head(out_cls_high)
-        pred_low = self.regression_head(out_cls_low)
-        pred_ultralow = self.regression_head(out_cls_ultralow)
+            pred_high = self.regression_head(out_cls_high)
+            pred_low = self.regression_head(out_cls_low)
+            pred_ultralow = self.regression_head(out_cls_ultralow)
             
 
         prediction = (pred_high+pred_low+pred_ultralow)/3

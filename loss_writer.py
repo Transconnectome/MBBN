@@ -190,8 +190,9 @@ class Writer():
                 self.losses['regression']['is_active'] = True
             else:
                 self.losses['binary_classification']['is_active'] = True 
-            if kwargs.get('spatiotemporal'):
-                self.losses['spatial_difference']['is_active'] = True
+            if kwargs.get('spatiotemporal') or kwargs.get('spatial'):
+                if kwargs.get('task') != 'vanilla_BERT':
+                    self.losses['spatial_difference']['is_active'] = True
 
     def append_total_to_losses(self):
         loss_d = self.losses.copy()

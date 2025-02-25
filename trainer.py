@@ -16,6 +16,8 @@ from torch.nn import MSELoss,L1Loss,BCELoss, BCEWithLogitsLoss, Sigmoid
 
 # profling
 from torch.profiler import profile, record_function, ProfilerActivity
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 #DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -105,8 +107,14 @@ class Trainer():
             if loss_dict['is_active']:
                 print('using {} loss'.format(name))
                 setattr(self, name + '_loss_func', loss_dict['criterion'])
-
+        self.non_tensor_keys = 'subject_name'
+        self.tensor_keys = None
     
+    def _setup_tensor_keys(self, input_dict):
+        if self.tensor_keys is None:
+            self.tensor_keys = [k for k in input_dict.keys() 
+                              if k not in self.non_tensor_keys]
+            
     def _sort_pth_files(self, files_Path):
         file_name_and_time_lst = []
         for f_name in os.listdir(files_Path):
@@ -203,8 +211,15 @@ class Trainer():
             if self.fmri_dividing_type == 'three_channels':
                 self.model = Transformer_Finetune_Three_Channels(**self.kwargs)
          
-        elif self.task.lower() == 'divfreqbert_reconstruction':
+        elif self.task.lower() == 'mbbn_reconstruction':
             self.model = Transformer_Reconstruction_Three_Channels (**self.kwargs)
+        
+        # self.model = torch.compile(self.model, backend='inductor', mode='reduce-overhead', fullgraph=False)
+        
+        for name, module in self.model.named_children():
+            if "attention" not in name.lower():
+                module = torch.compile(module, mode='reduce-overhead')
+        
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"Number of parameters of the model: {total_params}")
         
@@ -229,9 +244,10 @@ class Trainer():
                     self.model = torch.nn.parallel.DistributedDataParallel(self.model,find_unused_parameters=True) 
                 model_without_ddp = self.model.module
         else:
+            print('no DP, no DDP')
             self.device = torch.device("cuda" if self.cuda else "cpu")
-            
-            self.model = DataParallel(self.model).to(self.device)
+            self.model = self.model.to(self.device)
+            #self.model = DataParallel(self.model).to(self.device)
 
             
 
@@ -272,172 +288,157 @@ class Trainer():
                 metadata=None)
             sys.exit()
         
-        if self.profiling == True:
+        if self.profiling:
             self.nEpochs = 1
-        for epoch in range(self.st_epoch,self.nEpochs + 1): 
+        
+        # epoch loop 시작 전에 첫 batch로 setup
+        first_batch = next(iter(self.train_loader))
+        self._setup_tensor_keys(first_batch)
+
+        for epoch in range(self.st_epoch, self.nEpochs + 1):
             start = time.time()
             self.train_epoch(epoch)
-            if self.target != 'reconstruction':
-                if self.prepare_visualization:
-                    self.eval_epoch('val')
-                    print('\n______epoch summary {}/{}_____\n'.format(epoch,self.nEpochs))
-                    self.writer.loss_summary(lr=self.optimizer.param_groups[0]['lr'])
-                    if self.fine_tune_task == 'regression':
-                        self.writer.accuracy_summary(mid_epoch=False, mean=self.mean, std=self.std)
-                    else:
-                        self.writer.accuracy_summary(mid_epoch=False, mean=None, std=None)
-                    self.writer.save_history_to_csv()
 
-                    #wandb
-                    if self.rank == 0:
-                        self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
-                        self.save_checkpoint_(epoch, len(self.train_loader), self.scaler)
-                    
-                else:
-                    self.eval_epoch('val')
-                    self.eval_epoch('test')
-
-                    print('\n______epoch summary {}/{}_____\n'.format(epoch,self.nEpochs))
-                    self.writer.loss_summary(lr=self.optimizer.param_groups[0]['lr'])
-                    if self.fine_tune_task == 'regression':
-                        self.writer.accuracy_summary(mid_epoch=False, mean=self.mean, std=self.std)
-                    else:
-                        self.writer.accuracy_summary(mid_epoch=False, mean=None, std=None)
-                    self.writer.save_history_to_csv()
-
-                    #wandb
-                    if self.rank == 0:
-                        self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
-
-
-                    for metric_name in dir(self.writer):
-                        if 'history' not in metric_name:
-                            continue
-                        # metric_name =  save history to csv
-                        metric_score = getattr(self.writer, metric_name)
-            
-                end = time.time()
-
-                print(f'time taken to perform {epoch}: {end-start:.2f}')
-            
+            if self.target == 'reconstruction':
+                self._handle_reconstruction_epoch(epoch)
             else:
-                # reconstruction case #
-                print('\n______epoch summary {}/{}_____\n'.format(epoch,self.nEpochs))
-                self.writer.loss_summary(lr=self.optimizer.param_groups[0]['lr'])
-                if self.fine_tune_task == 'regression':
-                    self.writer.accuracy_summary(mid_epoch=False, mean=self.mean, std=self.std)
-                else:
-                    self.writer.accuracy_summary(mid_epoch=False, mean=None, std=None)
-                self.writer.save_history_to_csv()
+                self._handle_regular_epoch(epoch)
 
-                #wandb
-                if self.rank == 0:
-                    self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
-                    self.save_checkpoint_(epoch, len(self.train_loader), self.scaler) 
-
-                end = time.time()
-
-                print(f'time taken to perform {epoch}: {end-start:.2f}')
-                
-        return self.best_AUROC, self.best_loss, self.best_MAE #validation AUROC        
+            end = time.time()
+            print(f'time taken to perform {epoch}: {end-start:.2f}')
+            
+        return self.best_AUROC, self.best_loss, self.best_MAE        
    
- 
-    def train_epoch(self,epoch):
-        #torch.autograd.set_detect_anomaly(True)
+    def _handle_reconstruction_epoch(self, epoch):
+        print(f'\n______epoch summary {epoch}/{self.nEpochs}_____\n')
+        self._update_metrics(epoch)
+
+        if self.rank == 0:
+            self.save_checkpoint_(epoch, len(self.train_loader), self.scaler)
+
+    def _handle_regular_epoch(self, epoch):
+        if self.prepare_visualization:
+            self.eval_epoch('val')
+                
+        else:
+            self.eval_epoch('val')
+            self.eval_epoch('test')
+
+        print(f'\n______epoch summary {epoch}/{self.nEpochs}_____\n')
+        self._update_metrics(epoch)
+
+    def _update_metrics(self, epoch):
+        self.writer.loss_summary(lr=self.optimizer.param_groups[0]['lr'])
+
+        mean = self.mean if self.fine_tune_task == 'regression' else None
+        std = self.std if self.fine_tune_task == 'regression' else None
+        self.writer.accuracy_summary(mid_epoch=False, mean=mean, std=std)
+
+        self.writer.save_history_to_csv()
+
+        if self.rank == 0:
+            self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
+            if self.prepare_visualization:
+                self.save_checkpoint_(epoch, len(self.train_loader), self.scaler)
+        
+    def train_epoch(self, epoch):
         if self.distributed:
             self.train_loader.sampler.set_epoch(epoch)
         self.train()
-        
-        if torch.cuda.is_available():
-            max_allocated = torch.cuda.max_memory_allocated() 
-            max_cached = torch.cuda.max_memory_cached() 
 
+        self._monitor_cuda_memory()
+        print("Starting iteration...")
+
+        if self.profiling:
+            # 프로파일러 설정
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profile'),
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=True
+            ) as prof:
+                # 프로파일링할 배치 수행
+                for batch_idx, input_dict in enumerate(tqdm(self.train_loader, position=0, leave=True)):
+                    if batch_idx > 10:  # 10배치까지만 프로파일링
+                        break
+                    self._train_step(batch_idx, input_dict)
+                    prof.step()
+
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            sys.exit()
+        else:
+            # 일반 학습 수행
+            for batch_idx, input_dict in enumerate(tqdm(self.train_loader, position=0, leave=True)):
+                self._train_step(batch_idx, input_dict)
+
+        torch.cuda.empty_cache()
+
+    def _monitor_cuda_memory(self):
+        if torch.cuda.is_available():
+            max_allocated = torch.cuda.max_memory_allocated()
+            max_cached = torch.cuda.max_memory_cached()
             print(f"max allocated memory: {max_allocated / (1024 * 1024):.2f} MB")
             print(f"max cached memory: {max_cached / (1024 * 1024):.2f} MB")
         else:
             print("no cuda device")
 
-        times = []
-        print("Starting iteration...")
-        if self.profiling:
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                for batch_idx, input_dict in enumerate(tqdm(self.train_loader,position=0,leave=True)): 
-                    if batch_idx > 10:  # 처음 10개 배치만
-                        sys.exit()
-                    ### training ###
-                    #start_time = time.time()
-                    torch.cuda.nvtx.range_push("training steps")
-                    self.writer.total_train_steps += 1
-                    self.optimizer.zero_grad()
-                    if self.amp:
-                        torch.cuda.nvtx.range_push("forward pass")
-                        with autocast():
-                            loss_dict, loss = self.forward_pass(input_dict)
-                        torch.cuda.nvtx.range_pop()
-                        loss = loss / self.accumulation_steps # gradient accumulation
-                        torch.cuda.nvtx.range_push("backward pass")
-                        self.scaler.scale(loss).backward()
-                        torch.cuda.nvtx.range_pop()
+    def _train_step(self, batch_idx, input_dict):
+        torch.cuda.nvtx.range_push("training steps")
+        self.writer.total_train_steps += 1
+        self.optimizer.zero_grad()
 
-                        if  (batch_idx + 1) % self.accumulation_steps == 0: # gradient accumulation
-                            # gradient clipping 
-                            if self.gradient_clipping == True:
-                                self.scaler.unscale_(self.optimizer)
-                                # print('executing gradient clipping')
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1, error_if_nonfinite=False)
+        skip_lr_sched = False
 
-                            self.scaler.step(self.optimizer)
-                            scale = self.scaler.get_scale()
-                            self.scaler.update()
-                            skip_lr_sched = (scale > self.scaler.get_scale())
-                        if not skip_lr_sched:
-                            self.lr_handler.schedule_check_and_update(self.optimizer) 
-                    else:
-                        loss_dict, loss = self.forward_pass(input_dict)
-                        loss.backward()
-                        self.optimizer.step()
-                        self.lr_handler.schedule_check_and_update(self.optimizer)
+        if self.amp:
+            skip_lr_sched = self._train_step_amp(batch_idx, input_dict)
+        else:
+            self._train_step_normal(input_dict)
 
-                    self.writer.write_losses(loss_dict, set='train')
-                    torch.cuda.empty_cache()
-            
-        for batch_idx, input_dict in enumerate(tqdm(self.train_loader,position=0,leave=True)): 
-            ### training ###
-            #start_time = time.time()
-            torch.cuda.nvtx.range_push("training steps")
-            self.writer.total_train_steps += 1
-            self.optimizer.zero_grad()
-            if self.amp:
-                torch.cuda.nvtx.range_push("forward pass")
-                with autocast():
-                    loss_dict, loss = self.forward_pass(input_dict)
-                torch.cuda.nvtx.range_pop()
-                loss = loss / self.accumulation_steps # gradient accumulation
-                torch.cuda.nvtx.range_push("backward pass")
-                self.scaler.scale(loss).backward()
-                torch.cuda.nvtx.range_pop()
+        if not skip_lr_sched:
+            self.lr_handler.schedule_check_and_update(self.optimizer)
 
-                if  (batch_idx + 1) % self.accumulation_steps == 0: # gradient accumulation
-                    # gradient clipping 
-                    if self.gradient_clipping == True:
-                        self.scaler.unscale_(self.optimizer)
-                        # print('executing gradient clipping')
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1, error_if_nonfinite=False)
+        torch.cuda.nvtx.range_pop()
 
-                    self.scaler.step(self.optimizer)
-                    scale = self.scaler.get_scale()
-                    self.scaler.update()
-                    skip_lr_sched = (scale > self.scaler.get_scale())
-                if not skip_lr_sched:
-                    self.lr_handler.schedule_check_and_update(self.optimizer) 
-            else:
-                loss_dict, loss = self.forward_pass(input_dict)
-                loss.backward()
-                self.optimizer.step()
-                self.lr_handler.schedule_check_and_update(self.optimizer)
-                
-            self.writer.write_losses(loss_dict, set='train')
-            torch.cuda.empty_cache()
+    def _train_step_amp(self, batch_idx, input_dict):
+        torch.cuda.nvtx.range_push("forward pass")
+        with autocast():
+            loss_dict, loss = self.forward_pass(input_dict)
+        torch.cuda.nvtx.range_pop()
+
+        loss = loss / self.accumulation_steps
+
+        torch.cuda.nvtx.range_push("backward pass")
+        self.scaler.scale(loss).backward()
+        torch.cuda.nvtx.range_pop()
+
+        skip_lr_sched = False
+        if (batch_idx + 1) % self.accumulation_steps == 0:
+            if self.gradient_clipping:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    max_norm=1, 
+                    error_if_nonfinite=False
+                )
+
+            self.scaler.step(self.optimizer)
+            scale = self.scaler.get_scale()
+            self.scaler.update()
+            skip_lr_sched = (scale > self.scaler.get_scale())
+
+        self.writer.write_losses(loss_dict, set='train')
+        return skip_lr_sched
+
+    def _train_step_normal(self, input_dict):
+        loss_dict, loss = self.forward_pass(input_dict)
+        loss.backward()
+        self.optimizer.step()
+        self.writer.write_losses(loss_dict, set='train')
                 
     def eval_epoch(self,set):
         loader = self.val_loader if set == 'val' else self.test_loader
@@ -447,55 +448,48 @@ class Trainer():
                 with autocast():
                     loss_dict, _ = self.forward_pass(input_dict)
                 self.writer.write_losses(loss_dict, set=set)
-                if self.profiling == True:
-                    if batch_idx == 10 : 
-                        break
         
-    def forward_pass(self,input_dict):
-        input_dict = {k:(v.to(self.gpu) if (self.cuda and torch.is_tensor(v)) else v) for k,v in input_dict.items()}
-        ###### test ######
-        if self.task.lower() == 'test':
-            if self.fmri_type in ['timeseries', 'frequency', 'time_domain_high', 'time_domain_low', 'time_domain_ultralow', 'frequency_domain_low', 'frequency_domain_ultralow', 'frequency_domain_high']:
-                if self.ablation == 'raw_signal_for_att_conn':
-                    output_dict = self.model(input_dict['fmri_sequence'], input_dict['fmri_sequence'], input_dict['fmri_sequence'])
-                else:
-                    output_dict = self.model(input_dict['fmri_sequence'])
-            elif self.fmri_type == 'divided_timeseries':
-                if self.fmri_dividing_type == 'two_channels':
-                    output_dict = self.model(input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
-                elif self.fmri_dividing_type == 'three_channels':
-                    output_dict = self.model(input_dict['fmri_highfreq_sequence'], input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
-  
+    def forward_pass(self, input_dict):
         
-        #### train & valid ####
-        else:
-            if self.fmri_type in ['timeseries', 'frequency', 'time_domain_high', 'time_domain_low', 'time_domain_ultralow', 'frequency_domain_low', 'frequency_domain_ultralow', 'frequency_domain_high']:
-                if self.flop_counter:
-                    input_size = input_dict['fmri_sequence'].shape
-                    print('flop is', calculate_model_flops(self.model, input_size, 'vanilla_BERT'))
-                    sys.exit()
-                if self.ablation == 'raw_signal_for_att_conn':
-                    output_dict = self.model(input_dict['fmri_sequence'], input_dict['fmri_sequence'], input_dict['fmri_sequence'])
-                else:
-                    output_dict = self.model(input_dict['fmri_sequence'])
-            elif self.fmri_type == 'divided_timeseries':
-                if self.flop_counter:
-                    input_size = input_dict['fmri_highfreq_sequence'].shape
-                    print('flop is', calculate_model_flops(self.model, input_size, 'mbbn'))
-                    sys.exit()
-                if self.fmri_dividing_type == 'two_channels':
-                    output_dict = self.model(input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
-                elif self.fmri_dividing_type == 'three_channels':
-                    output_dict = self.model(input_dict['fmri_highfreq_sequence'], input_dict['fmri_lowfreq_sequence'], input_dict['fmri_ultralowfreq_sequence'])
+#         print('nan in high?', torch.sum(torch.isnan(input_dict['fmri_highfreq_sequence'])))
+#         print('nan in low?', torch.sum(torch.isnan(input_dict['fmri_lowfreq_sequence'])))
+#         print('nan in ultralow?', torch.sum(torch.isnan(input_dict['fmri_ultralowfreq_sequence'])))
+                    
+        if self.flop_counter:
+            input_size = input_dict['fmri_highfreq_sequence'].shape
+            calculate_model_flops(self.model, input_size, 'mbbn')
+            sys.exit()
+        # 모델 초기화 시점에 forward_func 결정
+        if not hasattr(self, '_forward_func'):
+            self._setup_forward_func()
+    
+        # tensor들은 한 번에 GPU로 전송
+        if self.cuda:
+            for k in self.tensor_keys:
+                input_dict[k] = input_dict[k].cuda(non_blocking=True)
             
-            
-        torch.cuda.nvtx.range_push("aggregate_losses")
+        # 미리 결정된 forward 함수 실행
+        output_dict = self._forward_func(input_dict)
+
         loss_dict, loss = self.aggregate_losses(input_dict, output_dict)
-        torch.cuda.nvtx.range_pop()
-        if self.task.lower() in ['vanilla_bert', 'mbbn', 'test']:
-            if self.target != 'reconstruction':
-                self.compute_accuracy(input_dict, output_dict)
+
+        if self.task.lower() in ['vanilla_bert', 'mbbn', 'test'] and self.target != 'reconstruction':
+            self.compute_accuracy(input_dict, output_dict)
+
         return loss_dict, loss
+
+    def _setup_forward_func(self):
+        if self.ablation == 'raw_signal_for_att_conn':
+            self._forward_func = lambda x: self.model(x['fmri_sequence'], x['fmri_sequence'], x['fmri_sequence'])
+        else:
+            if self.fmri_type == 'divided_timeseries':
+                if self.fmri_dividing_type == 'two_channels':
+                    self._forward_func = lambda x: self.model(x['fmri_lowfreq_sequence'], x['fmri_ultralowfreq_sequence'])
+                elif self.fmri_dividing_type == 'three_channels':
+                    self._forward_func = lambda x: self.model(x['fmri_highfreq_sequence'], x['fmri_lowfreq_sequence'], x['fmri_ultralowfreq_sequence'])
+            else:
+                self._forward_func = lambda x: self.model(x['fmri_sequence'])
+                
     
     def aggregate_losses(self,input_dict,output_dict):
         final_loss_dict = {}
@@ -509,12 +503,10 @@ class Trainer():
                 if current_loss_value.isnan().sum() > 0:
                     warnings.warn('found nans in computation')
                     print('at {} loss'.format(loss_name))
-                    print(input_dict['subject_name'])
                     
                     if self.target != 'reconstruction':
-                    
                         self.nan_list+=np.array(input_dict['subject_name'])[(output_dict[self.fine_tune_task].reshape(output_dict[self.fine_tune_task].shape[0],-1).isnan().sum(axis=1).detach().cpu().numpy() > 0)].tolist()
-                        print('current_nan_list:',set(self.nan_list))
+                        print('current_nan_list:', self.nan_list)
                     
                 lamda = current_loss_dict['factor']
                 factored_loss = current_loss_value * lamda
@@ -604,7 +596,7 @@ class Trainer():
 
         # Build checkpoint dict to save.
         ckpt_dict = {
-            'model_state_dict':self.model.module.state_dict(),
+            'model_state_dict':self.model.state_dict(), # self.model.module.state_dict(),
             'optimizer_state_dict':self.optimizer.state_dict() if self.optimizer is not None else None,
             'epoch':epoch,
             'loss_value':loss,

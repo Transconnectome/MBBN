@@ -335,26 +335,33 @@ class DataHandler():
             return training_generator, val_generator, test_generator
     
     
+    
     def get_params(self,eval=False,**kwargs):
         batch_size = kwargs.get('batch_size')
         workers = kwargs.get('workers')
         cuda = kwargs.get('cuda')
         #if eval:
         #    workers = 0
-        '''
+        
+        def worker_init_fn(worker_id):
+            torch.cuda.empty_cache()  # 각 worker 시작 시 GPU 캐시 정리
+        
         params = {'batch_size': batch_size,
                   #'shuffle': True,
                   'num_workers': workers,
                   'drop_last': True,
                   'pin_memory': True,  # True if cuda else False,
-                  'persistent_workers': True if workers > 0 and cuda else False}
-      '''
+                  'persistent_workers': True if workers > 0 and cuda else False,
+                  'prefetch_factor' : 2 if workers>0 else None,
+                  'worker_init_fn' : worker_init_fn}
+        '''
         params = {'batch_size': batch_size,
-                  'num_workers': workers,
-                  'drop_last': False,
-                  'pin_memory': False,
-                  'persistent_workers': False}
-        
+          #'shuffle': True,
+          'num_workers': workers,
+          'drop_last': True,
+          'pin_memory': False,
+          'persistent_workers': False}
+        '''
         return params
 
     def convert_subject_list_to_idx_list(self,train_names,val_names,test_names,subj_list):

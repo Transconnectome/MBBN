@@ -90,7 +90,7 @@ def weight_loader(args):
             if os.path.exists(args.model_weights_path_ABCD):
                 model_weights_path = args.model_weights_path_ABCD
         elif args.step == '3' :
-            task = 'divfreqBERT_reconstruction'
+            task = 'MBBN_reconstruction'
         elif args.step == '4':
             task = None # test phase (for visualization)
             if os.path.exists(args.model_weights_path_phase2):

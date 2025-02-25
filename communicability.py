@@ -2,11 +2,11 @@ import nitime
 import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 from nitime.timeseries import TimeSeries
 from nitime.analysis import SpectralAnalyzer, FilterAnalyzer, NormalizationAnalyzer
 from multiprocessing import Pool, cpu_count
-from scipy.optimize import curve_fit
+from lmfit import Model
 import scipy.stats as stats
 import pywt
 import networkx as nx
@@ -16,8 +16,8 @@ def get_arguments(base_path = os.getcwd()):
     parser = argparse.ArgumentParser()
     parser.add_argument('--ROI_num', type=int,default=400, choices=[180, 400])
     parser.add_argument('--ukb_path', default='/scratch/connectome/stellasybae/UKB_ROI') ## labserver
-    parser.add_argument('--abcd_path', default='/storage/bigdata/ABCD/fmriprep/1.rs_fmri/5.ROI_DATA') ## labserver
-    parser.add_argument('--dataset_name', type=str, choices=['ABCD', 'UKB'], default="ABCD")
+    parser.add_argument('--abcd_path', default='/scratch/connectome/stellasybae/ABCD_ROI/7.ROI') ## labserver
+    parser.add_argument('--dataset_name', type=str, choices=['ABCD', 'UKB'], default="UKB")
     parser.add_argument('--base_path', type=str, default=os.getcwd())
     args = parser.parse_args()
         
@@ -99,41 +99,63 @@ def main(sub):
 
 
 
-        def lorentzian_function(x, s0, corner):
-            return (s0*corner**2) / (x**2 + corner**2)
+        sample_whole = np.zeros(self.sequence_length,)
+            for i in range(self.intermediate_vec):
+                sample_whole+=y[i]
 
-        p0 = [0, 0.006]
+            sample_whole /= self.intermediate_vec    
 
-        popt, pcov = curve_fit(lorentzian_function, xdata, ydata, p0=p0, maxfev = 5000)
+            T = TimeSeries(sample_whole, sampling_interval=TR)
+            S_original = SpectralAnalyzer(T)
+            
+            xdata = np.array(S_original.spectrum_fourier[0][1:])
+            ydata = np.abs(S_original.spectrum_fourier[1][1:])
 
-        f1 = popt[1]
+            
+            # lmfit model setting
+            model = Model(lorentzian_function)
+            params = model.make_params()
 
-        knee = round(popt[1]/(1/(sample_whole.shape[0]*TR)))
+            # Parameter initialization
+            params['s0'].set(value=900, min=0.0, max=1200.0)
+            params['f1'].set(value=0.05, min=0.01, max=0.1)
 
+            # Fitting
+            result = model.fit(ydata, params, x=xdata,
+                               method='differential_evolution',
+                               max_nfev=20000)
 
-        def modified_lorentzian_function(x, beta_low, beta_high, A, B, corner):
-            return np.where(x < corner, A * x**beta_low, B * x**beta_high)
-            #return A*x**(-beta_low) / (1+(x/corner)**beta_high)
+            f1 = result.params['f1'].value
 
-        p1 = [2, 1, 23, 25, 0.16]
+            model = Model(spline_multifractal)
+            params = model.make_params()
 
-        popt_mo, pcov = curve_fit(modified_lorentzian_function, xdata[knee:], ydata[knee:], p0=p1, maxfev = 50000)
-        pink = round(popt_mo[-1]/(1/(sample_whole.shape[0]*TR)))
-        f2 = popt_mo[-1]
+            params['beta_low'].set(value=-1.2, min=-5, max=-0.1)
+            params['beta_high'].set(value=-0.5, min=-5, max=-0.1)
+            params['A'].set(value=10, min=1, max=30) 
+            params['f2'].set(value=0.08, min=f1+0.001, max=0.2)
+            params['smoothness'].set(value=0.25, min=0.001, max=1.0) 
+
+            # Fitting 실행
+            result = model.fit(ydata[knee:], params, x=xdata[knee:],
+                       method='differential_evolution',
+                       max_nfev=20000)
+            f2 = result.params['f2'].value
+                
 
         # 01 high ~ (low+ultralow)
         T1 = TimeSeries(y, sampling_interval=TR)
         S_original1 = SpectralAnalyzer(T1)
         FA1 = FilterAnalyzer(T1, lb= f2)
-        high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
-        ultralow_low = FA1.data-FA1.filtered_boxcar.data
+        high = stats.zscore(FA1.fir.data, axis=1)
+        ultralow_low = FA1.data-FA1.fir.data
 
         # 02 low ~ ultralow
         T2 = TimeSeries(ultralow_low, sampling_interval=TR)
         S_original2 = SpectralAnalyzer(T2)
         FA2 = FilterAnalyzer(T2, lb=f1)
-        low = stats.zscore(FA2.filtered_boxcar.data, axis=1)
-        ultralow = stats.zscore(FA2.data-FA2.filtered_boxcar.data, axis=1)
+        low = stats.zscore(FA2.fir.data, axis=1)
+        ultralow = stats.zscore(FA2.data-FA2.fir.data, axis=1)
 
         high_G = create_network(wavelet_corr_mat(high))
         high_comm = nx.communicability(high_G)
@@ -185,7 +207,7 @@ low_comm_mat_whole = sum([results[i][1] for i in range(sub_num)]) / len(subject)
 ultralow_comm_mat_whole = sum([results[i][2] for i in range(sub_num)]) / len(subject)
 
 
-np.save(f'./data/comnunicability/{args.dataset_name}_high_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(high_comm_mat_whole, axis=1)))
-np.save(f'./data/comnunicability/{args.dataset_name}_low_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(low_comm_mat_whole, axis=1)))
-np.save(f'./data/comnunicability/{args.dataset_name}_ultralow_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(ultralow_comm_mat_whole, axis=1)))
+np.save(f'./data/comnunicability/{args.dataset_name}_new_high_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(high_comm_mat_whole, axis=1)))
+np.save(f'./data/comnunicability/{args.dataset_name}_new_low_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(low_comm_mat_whole, axis=1)))
+np.save(f'./data/comnunicability/{args.dataset_name}_new_ultralow_comm_ROI_order_{ROI_name}.npy', np.argsort(np.sum(ultralow_comm_mat_whole, axis=1)))
 # last ROI has highest communicability
