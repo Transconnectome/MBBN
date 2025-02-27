@@ -17,7 +17,6 @@ from scipy import stats
 import torch.nn.functional as F
 import nitime
 from scipy.optimize import curve_fit
-from lmfit import Model
 from iminuit import Minuit
 from numba import njit
 
@@ -224,6 +223,7 @@ class ABIDE_fMRI_timeseries(BaseDataset):
                 knee = 1
             
             if self.fmri_dividing_type == 'three_channels':
+                @njit
                 def least_squares(beta_low, beta_high, A, f2, smoothness):
                     y_pred = spline_multifractal(xdata[knee:], beta_low, beta_high, A, f2, smoothness)
                     return np.sum((y_pred - ydata[knee:])**2)
@@ -381,8 +381,12 @@ class ABIDE_fMRI_timeseries(BaseDataset):
                     FA1 = FilterAnalyzer(T1, lb = f2)
                 else:
                     FA1 = FilterAnalyzer(T1, lb = S_original1.spectrum_fourier[0][pink])
-                high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
-                ultralow_low = FA1.data-FA1.filtered_boxcar.data
+                if self.filtering_type == 'Boxcar':
+                    high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
+                    ultralow_low = FA1.data-FA1.filtered_boxcar.data
+                elif self.filtering_type == 'FIR':
+                    high = stats.zscore(FA1.fir.data, axis=1)
+                    ultralow_low = FA1.data-FA1.fir.data
                     
                 # 02 low ~ ultralow
                 T2 = TimeSeries(ultralow_low, sampling_interval=TR)
@@ -633,6 +637,7 @@ class UKB_fMRI_timeseries(BaseDataset):
                 pink = round(f2/(1/(sample_whole.shape[0]*TR)))
                 print('f2', f2)
                 '''
+                @njit
                 def least_squares(beta_low, beta_high, A, f2, smoothness):
                     y_pred = spline_multifractal(xdata[knee:], beta_low, beta_high, A, f2, smoothness)
                     return np.sum((y_pred - ydata[knee:])**2)
