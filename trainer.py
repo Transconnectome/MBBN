@@ -77,24 +77,21 @@ class Trainer():
                 self.train_loader, self.val_loader, self.test_loader = DataHandler(**kwargs).create_dataloaders()
             print("DataLoader created successfully")
             
-        self.lr_handler = LrHandler(self.train_loader, **kwargs)
+            self.lr_handler = LrHandler(self.train_loader, **kwargs)
                 
         self.create_model() # model on cpu
         self.load_model_checkpoint()
         self.set_model_device() # set DDP or DP after loading checkpoint at CPUs
         
         self.create_optimizer()
-        self.lr_handler.set_schedule(self.optimizer)
+        if not self.weightwatcher:
+            self.lr_handler.set_schedule(self.optimizer)
+            self.writer = Writer(sets, self.val_threshold, **kwargs)
+            self.sets = sets
+            
         self.scaler = GradScaler() 
-        
-        
         self.load_optim_checkpoint()
 
-        self.writer = Writer(sets, self.val_threshold, **kwargs)
-        self.sets = sets
-        
-        
-        
         #wandb
         os.environ["WANDB_API_KEY"] = self.wandb_key
         os.environ["WANDB_MODE"] = self.wandb_mode
@@ -102,13 +99,14 @@ class Trainer():
         wandb.watch(self.model,log='all',log_freq=10)
         
         self.nan_list = []
-
-        for name, loss_dict in self.writer.losses.items():
-            if loss_dict['is_active']:
-                print('using {} loss'.format(name))
-                setattr(self, name + '_loss_func', loss_dict['criterion'])
-        self.non_tensor_keys = 'subject_name'
-        self.tensor_keys = None
+        
+        if not self.weightwatcher:
+            for name, loss_dict in self.writer.losses.items():
+                if loss_dict['is_active']:
+                    print('using {} loss'.format(name))
+                    setattr(self, name + '_loss_func', loss_dict['criterion'])
+            self.non_tensor_keys = 'subject_name'
+            self.tensor_keys = None
     
     def _setup_tensor_keys(self, input_dict):
         if self.tensor_keys is None:
@@ -130,7 +128,7 @@ class Trainer():
         pths = self._sort_pth_files(self.experiment_folder)
         if self.transfer_learning:
             print(f'loading checkpoint from {self.pretrained_model_weights_path}')
-            self.state_dict = torch.load(self.pretrained_model_weights_path, map_location='cpu') #, map_location=self.device
+            self.state_dict = torch.load(self.pretrained_model_weights_path, map_location='cpu', weights_only=False) #, map_location=self.device
             self.model.load_partial_state_dict(self.state_dict['model_state_dict'],load_cls_embedding=False)
             self.model.loaded_model_weights_path = self.pretrained_model_weights_path
         else:   
@@ -146,7 +144,7 @@ class Trainer():
 
             elif self.loaded_model_weights_path: # if there are weights from previous phase
                 self.recent_pth = None
-                self.state_dict = torch.load(self.loaded_model_weights_path,map_location='cpu') #, map_location=self.device
+                self.state_dict = torch.load(self.loaded_model_weights_path,map_location='cpu', weights_only=False) #, map_location=self.device
                 self.model.load_partial_state_dict(self.state_dict['model_state_dict'],load_cls_embedding=True)
                 self.model.loaded_model_weights_path = self.loaded_model_weights_path
 
@@ -185,7 +183,10 @@ class Trainer():
 
             
     def create_optimizer(self):
-        lr = self.lr_handler.base_lr
+        if self.weightwatcher:
+            lr = 0.001
+        else:
+            lr = self.lr_handler.base_lr
         params = self.model.parameters()
         weight_decay = self.kwargs.get('weight_decay')
         optim = self.kwargs.get('optim') # we use Adam or AdamW
@@ -211,8 +212,8 @@ class Trainer():
             if self.fmri_dividing_type == 'three_channels':
                 self.model = Transformer_Finetune_Three_Channels(**self.kwargs)
          
-        elif self.task.lower() == 'mbbn_reconstruction':
-            self.model = Transformer_Reconstruction_Three_Channels (**self.kwargs)
+        elif self.task.lower() == 'mbbn_pretraining':
+            self.model = Transformer_Reconstruction_Three_Channels(**self.kwargs)
         
         # self.model = torch.compile(self.model, backend='inductor', mode='reduce-overhead', fullgraph=False)
         
@@ -264,7 +265,7 @@ class Trainer():
             df.to_csv(f'{self.weightwatcher_save_dir}/{self.exp_name}.csv', index=False) 
             plt.xlabel('layers')
             plt.ylabel('alpha')
-            if int(self.exp_name.split('epoch')[-1]) < 100:
+            if int(self.exp_name.split('epoch_')[-1]) < 100:
                 if self.exp_name.split('_')[0] == 'HCPMMP1':
                     plt.ylim(0, 12)  
                     plt.yticks(range(0, 13, 2))  
@@ -450,14 +451,13 @@ class Trainer():
                 self.writer.write_losses(loss_dict, set=set)
         
     def forward_pass(self, input_dict):
-        
-#         print('nan in high?', torch.sum(torch.isnan(input_dict['fmri_highfreq_sequence'])))
-#         print('nan in low?', torch.sum(torch.isnan(input_dict['fmri_lowfreq_sequence'])))
-#         print('nan in ultralow?', torch.sum(torch.isnan(input_dict['fmri_ultralowfreq_sequence'])))
-                    
         if self.flop_counter:
-            input_size = input_dict['fmri_highfreq_sequence'].shape
-            calculate_model_flops(self.model, input_size, 'mbbn')
+            if self.fmri_type == 'divided_timeseries':
+                input_size = input_dict['fmri_highfreq_sequence'].shape
+                calculate_model_flops(self.model, input_size, 'mbbn')
+            elif self.fmri_type == 'timeseries':
+                input_size = input_dict['fmri_sequence'].shape
+                calculate_model_flops(self.model, input_size, 'vanilla_BERT')
             sys.exit()
         # 모델 초기화 시점에 forward_func 결정
         if not hasattr(self, '_forward_func'):
