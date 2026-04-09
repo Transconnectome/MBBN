@@ -1,0 +1,13 @@
+.ipynb_checkpoints/
+__pycache__
+revision/
+splits/
+experiments/
+log/
+runs/
+weights/
+wandb/
+visualization/
+sample_visualization/
+tests/
+.nfs*
