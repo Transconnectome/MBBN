@@ -177,8 +177,10 @@ class DataHandler():
             # Released code wrote `self.target == 'DX_GROUP'` here -- a comparison
             # whose result is discarded, so this branch is a no-op. That turns out
             # to be the correct behaviour and is kept: the ABIDE branch below
-            # renames the DX_GROUP column to 'ASD' before splitting, and ABCD's
-            # metadata already uses 'ASD', so 'ASD' resolves for both. Left as an
+            # renames the DX_GROUP column to 'ASD' before splitting, and for ABCD
+            # the target is mapped back to the metadata's own 'ASD_label' column
+            # further down, so the frame passed to _split always carries a column
+            # that resolves. Left as an
             # explicit no-op rather than "fixed" into an assignment, which would
             # only change the split filename and invalidate existing split files.
             pass

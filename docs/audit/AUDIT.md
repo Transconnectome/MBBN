@@ -106,13 +106,16 @@ difference between row-stochastic attention maps. Two properties:
   0.0150 — exactly when every row is one-hot and the three bands point at different
   targets. The global optimum of the objective is single-target (star / hub) attention,
   independently of the data.
-- `S = 0` whenever the three maps agree, which is the state at initialisation, so
-  `-log S` is singular there and its gradient scales as `1/S`. Measured infinity-norm of
-  the gradient at logit scale 1e-4: 0.50, versus 1.6e-3 at scale 1.
+- `S = 0` whenever the three maps coincide exactly, so `-log S` is singular there and its
+  gradient scales as `1/S`. Random initialisation is not that point but is close to it:
+  measured `S = 0.00278` at the released initialisation, giving a finite loss of 588.6 at
+  lambda=100, and the gradient grows as the scale of the attention logits shrinks —
+  measured infinity-norm 0.50 at logit scale 1e-4 versus 1.6e-3 at scale 1.
 
 400 steps of the repulsion term alone, at the released fine-tuning learning rate on the
 released `Attention` module, moved mean row entropy from 0.9908 to 0.9625 of `log N` and
-the mean peak row weight from 2.55/N to 6.11/N — monotonically toward concentration.
+the mean peak row weight from 2.55/N to 6.11/N — a 2.39x increase, monotonic across all
+sampled steps.
 
 This matters for interpretation: a prior analysis of this paper's supplementary tables
 found that its top-100 features form a single-hub star structure per band. An objective
