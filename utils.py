@@ -12,6 +12,7 @@ import random
 import builtins
 import time
 import random
+import warnings
 
 def _get_sync_file():    
         """Logic for naming sync file using slurm env variables"""
@@ -79,55 +80,98 @@ def init_distributed(args):
         args.gpu = 0
 
         
-def weight_loader(args):
-    model_weights_path = None
-    try:
-        if args.step == '1' :
-            task = 'vanilla_BERT'
-            if os.path.exists(args.model_weights_path_ABCD):
-                model_weights_path = args.model_weights_path_ABCD
-        elif args.step == '2':
-            task = 'MBBN'
-            if os.path.exists(args.model_weights_path_ABCD):
-                model_weights_path = args.model_weights_path_ABCD
-        elif args.step == '3' :
-            task = 'MBBN_reconstruction'
-        elif args.step == '4':
-            task = None # test phase (for visualization)
-            if os.path.exists(args.model_weights_path_phase2):
-                model_weights_path = args.model_weights_path_phase2
-            
-    except:
-            #if no weights were provided
-            model_weights_path = None 
+_TASK_BY_STEP = {'1': 'vanilla_BERT', '2': 'MBBN', '3': 'MBBN_pretraining', '4': 'test'}
 
-    
-    # print(f'loading weight from {model_weights_path}')
-    return model_weights_path, args.step, task
+
+def weight_loader(args):
+    """Resolve (initial weights, step, task name) for the requested phase.
+
+    Only paths the parser actually defines are consulted, and a path that was
+    given but does not exist is an error rather than a silent fall-through to
+    random initialisation.
+    """
+    step = str(args.step)
+    if step not in _TASK_BY_STEP:
+        raise ValueError(f'unknown step {step!r}')
+    task = _TASK_BY_STEP[step]
+
+    candidate = getattr(args, 'model_weights_path_phase' + step, None)
+    if candidate is None:
+        candidate = getattr(args, 'pretrained_model_weights_path', None)
+    if candidate in (None, '', 'None'):
+        return None, step, task
+    if not os.path.exists(candidate):
+        raise FileNotFoundError(
+            f'--model_weights_path_phase{step} / --pretrained_model_weights_path '
+            f'points at {candidate!r}, which does not exist. Fix the path or omit '
+            f'the flag to train from scratch.')
+    return candidate, step, task
     
 def datestamp():
     time = datetime.now(timezone('Asia/Seoul')).strftime("%m_%d__%H_%M_%S")
     return time
 
 def reproducibility(**kwargs):
+    """Seed every RNG that affects training.
+
+    `deterministic=True` additionally pins cuDNN and asks torch for
+    deterministic kernels, which makes a run bit-reproducible at some cost in
+    throughput. The published default (`False`) is kept so existing runs are
+    unchanged.
+    """
     seed = kwargs.get('seed')
     cuda = kwargs.get('cuda')
+    deterministic = bool(kwargs.get('deterministic', False))
     torch.manual_seed(seed)
-    # Fix Python's built-in random module seed
     random.seed(seed)
     if cuda:
-        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
-    cudnn.deterministic = False #True
-    cudnn.benchmark = True
+    if deterministic:
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+    else:
+        cudnn.deterministic = False
+        cudnn.benchmark = True
 
-def sort_args(phase, args):
+
+def split_seed_of(kwargs):
+    """Seed governing the train/val/test partition.
+
+    Defaults to `seed` so existing split files keep their names; set
+    `--split_seed` to hold the partition fixed while varying weight init.
+    """
+    s = kwargs.get('split_seed')
+    return kwargs.get('seed') if s is None else s
+
+def sort_args(phase, args, explicit=None):
+    """Keep phase-agnostic arguments plus those tagged with the active phase.
+
+    `explicit` is the set of option names the user actually typed. Any of those
+    tagged for a *different* phase is dropped here, which silently reverts the
+    setting to its default; warn so that never happens unnoticed again.
+    """
+    phase = str(phase)
     phase_specific_args = {}
+    dropped = []
     for name, value in args.items():
         if not 'phase' in name:
             phase_specific_args[name] = value
         elif 'phase' + phase in name:
             phase_specific_args[name.replace('_phase' + phase, '')] = value
+        elif explicit and name in explicit:
+            dropped.append(name)
+    if dropped:
+        warnings.warn(
+            'these options were given on the command line but belong to another '
+            'phase, so they have NO effect on step {}: {}. Rename them to '
+            '*_phase{} if that is what you meant.'.format(phase, sorted(dropped), phase),
+            RuntimeWarning, stacklevel=2)
     return phase_specific_args
 
 def args_logger(args):

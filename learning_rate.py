@@ -6,6 +6,7 @@ from torch.autograd import Variable
 import torch
 import torch.nn as nn
 import re
+import warnings
 
 from torch.optim.lr_scheduler import StepLR
 from torch.optim import lr_scheduler
@@ -32,6 +33,23 @@ class LrHandler():
         self.warmup = int(self.total_iterations * 0.05) if kwargs.get('lr_warmup') is None else kwargs.get('lr_warmup')
         self.T_0 = int(0.3 * self.total_iterations) # 25800 in ABIDE
         self.T_mult = 1 if kwargs.get('lr_T_mult') is None else kwargs.get('lr_T_mult')
+
+        # `--lr_warmup` is an absolute step count but T_0 is derived as 30% of
+        # the total iterations, so the two can contradict each other: any run
+        # with fewer than lr_warmup/0.3 optimizer steps tripped a bare
+        # `assert warmup_steps < first_cycle_steps` with no message. The
+        # published ABIDE configuration sits just inside it (T_0=120 vs
+        # warmup=100), so a shorter run or a smaller cohort breaks it.
+        self.T_0 = max(2, self.T_0)
+        if self.warmup >= self.T_0:
+            clamped = max(1, int(0.1 * self.T_0))
+            warnings.warn(
+                f'lr_warmup={self.warmup} is >= the cosine cycle length T_0={self.T_0} '
+                f'(30% of {self.total_iterations} total steps = {self.num_iterations} '
+                f'batches x {self.epoch} epochs); clamping warmup to {clamped}. '
+                f'Set --lr_warmup explicitly, or train longer, to control this.',
+                RuntimeWarning)
+            self.warmup = clamped
 
 
     def set_lr(self,dict_lr):
@@ -105,7 +123,10 @@ class CosineAnnealingWarmUpRestarts(_LRScheduler):
                  gamma : float = 1.,
                  last_epoch : int = -1
         ):
-        assert warmup_steps < first_cycle_steps
+        assert warmup_steps < first_cycle_steps, (
+            f'warmup_steps={warmup_steps} must be < first_cycle_steps='
+            f'{first_cycle_steps}; LrHandler clamps this, so reaching here '
+            f'means the scheduler was constructed directly.')
         
         self.first_cycle_steps = first_cycle_steps # first cycle step size
         self.cycle_mult = cycle_mult # cycle steps magnification

@@ -32,6 +32,29 @@ SPATIAL_LOSS_FACTOR=10.0
 # Filtering: FIR for ABCD+HCP-MMP1 (Table 7); Boxcar otherwise
 FILTERING_TYPE=FIR
 
+# ── Hardening (docs/audit/AUDIT.md) ──────────────────────────────────────────
+#   --head_type linear        plain read-out. The published head batch-norms and
+#                             then drops out the *scalar logit*, which makes one
+#                             subject's prediction depend on its batch-mates
+#                             (SD 0.29 at batch 16) and zeroes 61% of logits.
+#   --spat_diff_loss_type     `minus_log` (published) is unbounded, singular
+#                             where the bands agree, and its global optimum is
+#                             one-hot (hub) attention. `neg_linear` is bounded.
+#   --spatial_loss_warmup     ramp λ so the 1/S transient at init cannot dominate
+#   --spatial_head            put the spatial maps on the prediction path; without
+#                             it d(prediction)/d(spatial attention) is exactly 0
+#   --band_embedding          let the shared encoder tell the three bands apart
+#   --site_stratify           balance acquisition site across folds
+#   --group_by_family         keep ABCD siblings inside one fold
+#   --cache_bands             memoise the per-subject knee fit + filtering
+HARDENING="--head_type linear --spat_diff_loss_type neg_linear \
+    --spatial_loss_warmup 500 --spatial_head --band_embedding \
+    --site_stratify --cache_bands --nan_policy raise --split_seed 1"
+# ABCD only: add --group_by_family to HARDENING.
+# To reproduce the published run exactly:
+#   HARDENING="--head_type published --spat_diff_loss_type minus_log \
+#              --eval_test_every_epoch --keep_all_best_checkpoints --no_padding_mask" 
+
 # ── Environment ──────────────────────────────────────────────────────────────
 source /usr/anaconda3/etc/profile.d/conda.sh
 conda activate mbbn
@@ -52,4 +75,5 @@ python main.py \
     --batch_size_phase2 32 \
     --lr_init_phase2 3e-5 \
     --seed ${SEED} \
-    --exp_name ${EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    ${HARDENING}
