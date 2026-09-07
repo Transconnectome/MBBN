@@ -1,4 +1,6 @@
 """Evaluation-protocol regressions: operating point, dropped subjects."""
+import inspect
+import pathlib
 import warnings
 import numpy as np
 import pytest
@@ -68,3 +70,67 @@ def test_spatial_loss_warmup_only_applies_while_training():
     src = inspect.getsource(tr.Trainer.aggregate_losses)
     assert "getattr(self, 'mode', 'train') == 'train'" in src, \
         'the spatial-loss warmup must be gated on training mode'
+
+
+def test_nvtx_helpers_delegate_and_do_not_recurse(monkeypatch):
+    """Guarded CUDA helpers must be exercisable without a GPU.
+
+    On a CPU wheel `torch.cuda.is_available()` is False, so a bug in the
+    guarded branch is invisible locally and only surfaces on a GPU box.
+    Force the branch and assert it delegates to torch.cuda.nvtx exactly once.
+    """
+    import torch
+    import trainer as tr
+    calls = []
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda.nvtx, 'range_push', lambda tag: calls.append(('push', tag)))
+    monkeypatch.setattr(torch.cuda.nvtx, 'range_pop', lambda: calls.append(('pop',)))
+    tr._nvtx_push('probe')
+    tr._nvtx_pop()
+    assert calls == [('push', 'probe'), ('pop',)]
+
+
+def test_every_cuda_only_call_sits_behind_a_guard():
+    """A CUDA-only call on a CPU wheel is fatal, and CPU CI cannot see it.
+
+    Static check over trainer.py: every torch.cuda call that requires a CUDA
+    build must live in a function that also tests torch.cuda.is_available().
+    """
+    import ast
+    import trainer as tr
+    CUDA_ONLY = {'empty_cache', 'reset_peak_memory_stats', 'max_memory_allocated',
+                 'max_memory_reserved', 'max_memory_cached', 'memory_cached',
+                 'synchronize', 'range_push', 'range_pop'}
+
+    def attr_path(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr); node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return '.'.join(reversed(parts))
+
+    src = pathlib.Path(tr.__file__).read_text()
+    tree = ast.parse(src)
+    unguarded = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        guarded = 'is_available' in (ast.get_source_segment(src, fn) or '')
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                path = attr_path(n.func)
+                if path.startswith('torch.cuda.') and path.split('.')[-1] in CUDA_ONLY and not guarded:
+                    unguarded.append((fn.name, n.lineno, path))
+    assert not unguarded, f'unguarded CUDA-only calls: {unguarded}'
+
+
+def test_nvtx_helper_does_not_call_itself():
+    """Regression: a regex sweep once rewrote the helper's own body,
+    so _nvtx_push recursed until RecursionError -- invisible on CPU because
+    the is_available() guard short-circuits, fatal on a GPU box."""
+    import trainer as tr
+    for fn in (tr._nvtx_push, tr._nvtx_pop):
+        body = inspect.getsource(fn)
+        assert 'torch.cuda.nvtx.' in body, f'{fn.__name__} must delegate to torch.cuda.nvtx'
+        assert body.count(fn.__name__) == 1, f'{fn.__name__} calls itself'

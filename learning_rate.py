@@ -35,11 +35,18 @@ class LrHandler():
         self.T_mult = 1 if kwargs.get('lr_T_mult') is None else kwargs.get('lr_T_mult')
 
         # `--lr_warmup` is an absolute step count but T_0 is derived as 30% of
-        # the total iterations, so the two can contradict each other: any run
-        # with fewer than lr_warmup/0.3 optimizer steps tripped a bare
-        # `assert warmup_steps < first_cycle_steps` with no message. The
-        # published ABIDE configuration sits just inside it (T_0=120 vs
-        # warmup=100), so a shorter run or a smaller cohort breaks it.
+        # the total iterations, so the two can contradict each other and the
+        # scheduler then tripped a bare `assert warmup_steps <
+        # first_cycle_steps` with no message.
+        #
+        # The condition is exactly: 0.3 * (batches_per_epoch * nEpochs) <=
+        # lr_warmup. With the phase-1/2/3 default lr_warmup=500 that is any run
+        # of fewer than ~1667 optimizer steps; the ABIDE fine-tuning script
+        # passes no lr_warmup and runs 50 epochs at batch 16, so it needs at
+        # least 34 batches per epoch (~544 training subjects) to clear it.
+        # Whether a given cohort clears it therefore depends on its size, which
+        # is not recorded in this repository -- hence a clamp with a diagnostic
+        # rather than an assertion.
         self.T_0 = max(2, self.T_0)
         if self.warmup >= self.T_0:
             clamped = max(1, int(0.1 * self.T_0))

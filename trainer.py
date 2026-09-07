@@ -45,13 +45,16 @@ except ImportError:                                     # torch < 2.4
 
 
 def _nvtx_push(tag):
+    # NVTX is a CUDA-build-only facility: calling it on a CPU wheel raises
+    # RuntimeError('NVTX functions not installed'), which made the released
+    # trainer impossible to smoke-test without a GPU.
     if torch.cuda.is_available():
-        _nvtx_push(tag)
+        torch.cuda.nvtx.range_push(tag)
 
 
 def _nvtx_pop():
     if torch.cuda.is_available():
-        _nvtx_pop()
+        torch.cuda.nvtx.range_pop()
 
 # wandb (optional: the pipeline must run without an account configured)
 try:
