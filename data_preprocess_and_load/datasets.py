@@ -13,8 +13,83 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+import hashlib
+
 from nitime.timeseries import TimeSeries
 from nitime.analysis import SpectralAnalyzer, FilterAnalyzer
+
+
+def safe_zscore(a, axis=1, eps=1e-8):
+    """z-score that does not emit NaN for a constant channel.
+
+    `scipy.stats.zscore` returns NaN when a channel has zero variance, and a
+    band-pass filter can flatten a parcel completely. Those NaNs propagate
+    through the encoder into the loss, where the released trainer rewrites them
+    to 0 -- so the run continues on a corrupted objective instead of failing.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    mu = a.mean(axis=axis, keepdims=True)
+    sd = a.std(axis=axis, keepdims=True)
+    n_flat = int((sd < eps).sum())
+    if n_flat:
+        warnings.warn(f'{n_flat} channel(s) have ~zero variance after filtering; '
+                      f'z-scoring them to 0 instead of NaN', RuntimeWarning)
+    return (a - mu) / np.maximum(sd, eps)
+
+
+def decompose_bands(y, TR, seq_len, intermediate_vec, filtering_type,
+                    lz_p0, lz_bounds, cache_key=None, cache_dir=None):
+    """Knee-frequency fit + three-band split, memoised on disk.
+
+    The fit (`curve_fit` + `Minuit.migrad`) and the nitime filtering are
+    deterministic functions of (subject, sequence length, TR, filter type), but
+    the released code runs them inside `__getitem__`, so every epoch repeats
+    identical work for every subject. Caching turns an O(epochs) cost into O(1).
+    """
+    if cache_key is not None and cache_dir:
+        tag = hashlib.sha1(
+            f'{cache_key}|{TR}|{seq_len}|{intermediate_vec}|{filtering_type}'.encode()
+        ).hexdigest()[:16]
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f'{tag}.npz')
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                return z['ultralow'], z['low'], z['high']
+            except Exception:
+                pass                                   # corrupt cache entry: recompute
+        f1, f2 = _find_knee_frequencies(y, TR, seq_len, intermediate_vec, lz_p0, lz_bounds)
+        ultralow, low, high = _filter_three_bands(y, TR, f1, f2, filtering_type)
+        # np.savez appends '.npz' unless the name already ends with it, so the
+        # temp name must carry the suffix or the file lands somewhere else.
+        tmp = f'{path[:-4]}.tmp{os.getpid()}.npz'
+        np.savez(tmp, ultralow=ultralow, low=low, high=high, f1=f1, f2=f2)
+        os.replace(tmp, path)                          # atomic: workers may race
+        return ultralow, low, high
+
+    f1, f2 = _find_knee_frequencies(y, TR, seq_len, intermediate_vec, lz_p0, lz_bounds)
+    return _filter_three_bands(y, TR, f1, f2, filtering_type)
+
+
+def pad_to(arr, target):
+    """Symmetric zero-pad [ROI, time] up to `target` and return (padded, valid).
+
+    The released code padded by `(pad // 2, pad // 2)`, which is one short of
+    the target whenever `pad` is odd, and it never told the model which
+    timepoints were padding.
+    """
+    import torch as _torch
+    n = arr.shape[-1]
+    pad = int(target) - n
+    if pad <= 0:
+        valid = _torch.ones(n, dtype=_torch.bool)
+        return _torch.as_tensor(arr), valid
+    left = pad // 2
+    right = pad - left
+    out = F.pad(_torch.as_tensor(arr), (left, right), 'constant', 0)
+    valid = _torch.zeros(int(target), dtype=_torch.bool)
+    valid[left:left + n] = True
+    return out, valid
 
 
 @njit
@@ -88,24 +163,21 @@ def _filter_three_bands(y, TR, f1, f2, filtering_type):
     T1 = TimeSeries(y, sampling_interval=TR)
     FA1 = FilterAnalyzer(T1, lb=f2)
     if filtering_type == 'FIR':
-        high = FA1.fir.data
-        # Guard against zero-variance ROIs after FIR filtering
-        std = np.std(high, axis=1, keepdims=True)
-        high = (high - high.mean(axis=1, keepdims=True)) / (std + 1e-10)
+        high = safe_zscore(FA1.fir.data, axis=1)
         ultralow_low = FA1.data - FA1.fir.data
     else:  # Boxcar
-        high = stats.zscore(FA1.filtered_boxcar.data, axis=1)
+        high = safe_zscore(FA1.filtered_boxcar.data, axis=1)
         ultralow_low = FA1.data - FA1.filtered_boxcar.data
 
     # Low and ultralow frequencies (split at f1)
     T2 = TimeSeries(ultralow_low, sampling_interval=TR)
     FA2 = FilterAnalyzer(T2, lb=f1)
     if filtering_type == 'FIR':
-        low = stats.zscore(FA2.fir.data, axis=1)
-        ultralow = stats.zscore(FA2.data - FA2.fir.data, axis=1)
+        low = safe_zscore(FA2.fir.data, axis=1)
+        ultralow = safe_zscore(FA2.data - FA2.fir.data, axis=1)
     else:  # Boxcar
-        low = stats.zscore(FA2.filtered_boxcar.data, axis=1)
-        ultralow = stats.zscore(FA2.data - FA2.filtered_boxcar.data, axis=1)
+        low = safe_zscore(FA2.filtered_boxcar.data, axis=1)
+        ultralow = safe_zscore(FA2.data - FA2.filtered_boxcar.data, axis=1)
 
     return ultralow, low, high
 
@@ -126,6 +198,20 @@ class BaseDataset(Dataset):
         self.finetune = kwargs.get('finetune')
         self.transfer_learning = bool(self.pretrained_model_weights_path) or self.finetune
         self.finetune_test = kwargs.get('finetune_test')
+        self.cache_bands = bool(kwargs.get('cache_bands', False))
+        self.cache_dir = kwargs.get('band_cache_dir') or os.path.join(
+            kwargs.get('base_path', '.'), 'cache', 'bands')
+        # length the model expects; only used when padding for transfer learning
+        self.pretrained_sequence_length = int(kwargs.get('pretrained_sequence_length') or 464)
+
+    def _cache_key(self, subj_name):
+        return None if not self.cache_bands else f'{self.dataset_name}|{subj_name}'
+
+    def item_keys(self):
+        """Keys __getitem__ returns, so the trainer need not fetch a batch."""
+        return ('fmri_highfreq_sequence', 'fmri_lowfreq_sequence',
+                'fmri_ultralowfreq_sequence', 'valid_mask', 'subject',
+                'subject_name', 'site', self.target)
 
 
 # ─── ABIDE ────────────────────────────────────────────────────────────────────
@@ -170,8 +256,8 @@ class ABIDE_fMRI_timeseries(BaseDataset):
                                  for i in os.listdir(self.data_dir)]
 
         non_na = self.meta_data.dropna(axis=0)
-        valid_sub = (set(str(i) for i in non_na['SUB_ID'])
-                     & set(unified_name_list))
+        valid_sub = sorted(set(str(i) for i in non_na['SUB_ID'])
+                           & set(unified_name_list))
 
         for filename in data_list:
             sub = filename.split('/')[-2]
@@ -202,34 +288,43 @@ class ABIDE_fMRI_timeseries(BaseDataset):
 
         y = np.load(path_to_fMRIs)[:self.sequence_length].T  # [ROI, seq_len]
 
-        # Padding to pretrained sequence length (464) for finetuning
-        pad = 464 - self.sequence_length
-
         # Site-specific TR
-        TR = next((v for k, v in self._SITE_TR.items() if k in site), 3.0)
+        # Substring matching is correct here: ABIDE SITE_IDs carry run suffixes
+        # ('UM_1', 'LEUVEN_2', 'MAX_MUN_a') and no key in _SITE_TR is a substring
+        # of another. Only the silent fallback is a hazard -- an unlisted site
+        # gets TR=3.0 with no indication, and TR sets the whole frequency axis
+        # (and therefore the band decomposition) for that subject.
+        TR = next((v for k, v in self._SITE_TR.items() if k in site), None)
+        if TR is None:
+            TR = 3.0
+            warnings.warn(f'site {site!r} matches no entry in _SITE_TR; falling back '
+                          f'to TR={TR}s. The knee frequencies f1/f2 and hence the '
+                          f'three bands are computed from TR, so a wrong TR silently '
+                          f'redefines this subject\'s bands.', RuntimeWarning)
 
-        f1, f2 = _find_knee_frequencies(
-            y, TR, self.sequence_length, self.intermediate_vec,
-            lz_p0=[900, 0.05],
-            lz_bounds=([0, 0.01], [1200, 0.1]))
+        ultralow, low, high = decompose_bands(
+            y, TR, self.sequence_length, self.intermediate_vec, self.filtering_type,
+            lz_p0=[900, 0.05], lz_bounds=([0, 0.01], [1200, 0.1]),
+            cache_key=self._cache_key(subj_name), cache_dir=self.cache_dir)
 
-        ultralow, low, high = _filter_three_bands(
-            y, TR, f1, f2, self.filtering_type)
-
-        # Always pad to match pretraining length (464)
-        high = F.pad(torch.from_numpy(high),
-                     (pad // 2, pad // 2), 'constant', 0).T.float()
-        low = F.pad(torch.from_numpy(low),
-                    (pad // 2, pad // 2), 'constant', 0).T.float()
-        ultralow = F.pad(torch.from_numpy(ultralow),
-                         (pad // 2, pad // 2), 'constant', 0).T.float()
+        # Pad to the pretrained length only when a pretrained model is involved.
+        # The released code padded unconditionally to 464, so a from-scratch run
+        # at --sequence_length_phase2 280 fed 464 timepoints to a model whose
+        # position embeddings only go to 281.
+        target_len = self.pretrained_sequence_length \
+            if (self.transfer_learning or self.finetune_test) else self.sequence_length
+        high, valid = pad_to(high, target_len)
+        low, _ = pad_to(low, target_len)
+        ultralow, _ = pad_to(ultralow, target_len)
 
         return {
-            'fmri_highfreq_sequence': high,
-            'fmri_lowfreq_sequence': low,
-            'fmri_ultralowfreq_sequence': ultralow,
+            'fmri_highfreq_sequence': high.T.float(),
+            'fmri_lowfreq_sequence': low.T.float(),
+            'fmri_ultralowfreq_sequence': ultralow.T.float(),
+            'valid_mask': valid,
             'subject': subj,
             'subject_name': subj_name,
+            'site': site,
             self.target: target,
         }
 
@@ -253,11 +348,14 @@ class UKB_fMRI_timeseries(BaseDataset):
 
         if self.target != 'reconstruction':
             non_na = self.meta_data[['eid', self.target]].dropna(axis=0)
-            subjects = list(set(non_na['eid']) & set(valid_sub))
+            subjects = sorted(set(non_na['eid']) & set(valid_sub))
         else:
-            subjects = valid_sub
+            subjects = sorted(valid_sub)
 
         if self.fine_tune_task == 'regression':
+            if self.target == 'reconstruction':
+                raise ValueError("fine_tune_task='regression' is incompatible with "
+                                 "target='reconstruction'")
             cont_mean = non_na[self.target].mean()
             cont_std = non_na[self.target].std()
             self.mean = cont_mean
@@ -298,22 +396,22 @@ class UKB_fMRI_timeseries(BaseDataset):
         # Skip first 20 dummy scans
         y = np.load(path_to_fMRIs)[20:20 + self.sequence_length].T
 
-        f1, f2 = _find_knee_frequencies(
-            y, self.TR, self.sequence_length, self.intermediate_vec,
-            lz_p0=[900, 0.05],
-            lz_bounds=([0, 0.01], [1200, 0.1]))
+        ultralow, low, high = decompose_bands(
+            y, self.TR, self.sequence_length, self.intermediate_vec, self.filtering_type,
+            lz_p0=[900, 0.05], lz_bounds=([0, 0.01], [1200, 0.1]),
+            cache_key=self._cache_key(subj_name), cache_dir=self.cache_dir)
 
-        ultralow, low, high = _filter_three_bands(
-            y, self.TR, f1, f2, self.filtering_type)
-
-        high = torch.from_numpy(high).T.float()
-        low = torch.from_numpy(low).T.float()
-        ultralow = torch.from_numpy(ultralow).T.float()
+        target_len = self.pretrained_sequence_length \
+            if (self.transfer_learning or self.finetune_test) else self.sequence_length
+        high, valid = pad_to(high, target_len)
+        low, _ = pad_to(low, target_len)
+        ultralow, _ = pad_to(ultralow, target_len)
 
         return {
-            'fmri_highfreq_sequence': high,
-            'fmri_lowfreq_sequence': low,
-            'fmri_ultralowfreq_sequence': ultralow,
+            'fmri_highfreq_sequence': high.T.float(),
+            'fmri_lowfreq_sequence': low.T.float(),
+            'fmri_ultralowfreq_sequence': ultralow.T.float(),
+            'valid_mask': valid,
             'subject': subj,
             'subject_name': subj_name,
             self.target: target,
@@ -348,9 +446,9 @@ class ABCD_fMRI_timeseries(BaseDataset):
 
         if self.target != 'reconstruction':
             non_na = self.meta_data[['subjectkey', self.target]].dropna(axis=0)
-            subjects = list(set(non_na['subjectkey']) & set(valid_sub))
+            subjects = sorted(set(non_na['subjectkey']) & set(valid_sub))
         else:
-            subjects = valid_sub
+            subjects = sorted(valid_sub)
 
         if self.fine_tune_task == 'regression':
             cont_mean = non_na[self.target].mean()
@@ -391,33 +489,22 @@ class ABCD_fMRI_timeseries(BaseDataset):
 
         y = np.load(path_to_fMRIs)[:self.sequence_length].T  # [ROI, seq_len]
 
-        if self.transfer_learning or self.finetune_test:
-            pad = 464 - self.sequence_length
+        ultralow, low, high = decompose_bands(
+            y, self.TR, self.sequence_length, self.intermediate_vec, self.filtering_type,
+            lz_p0=[1, 0.05], lz_bounds=([0, 0.01], [15, 0.1]),
+            cache_key=self._cache_key(subj_name), cache_dir=self.cache_dir)
 
-        f1, f2 = _find_knee_frequencies(
-            y, self.TR, self.sequence_length, self.intermediate_vec,
-            lz_p0=[1, 0.05],
-            lz_bounds=([0, 0.01], [15, 0.1]))
-
-        ultralow, low, high = _filter_three_bands(
-            y, self.TR, f1, f2, self.filtering_type)
-
-        if self.transfer_learning or self.finetune_test:
-            high = F.pad(torch.from_numpy(high),
-                         (pad // 2, pad // 2), 'constant', 0).T.float()
-            low = F.pad(torch.from_numpy(low),
-                        (pad // 2, pad // 2), 'constant', 0).T.float()
-            ultralow = F.pad(torch.from_numpy(ultralow),
-                             (pad // 2, pad // 2), 'constant', 0).T.float()
-        else:
-            high = torch.from_numpy(high).T.float()
-            low = torch.from_numpy(low).T.float()
-            ultralow = torch.from_numpy(ultralow).T.float()
+        target_len = self.pretrained_sequence_length \
+            if (self.transfer_learning or self.finetune_test) else self.sequence_length
+        high, valid = pad_to(high, target_len)
+        low, _ = pad_to(low, target_len)
+        ultralow, _ = pad_to(ultralow, target_len)
 
         return {
-            'fmri_highfreq_sequence': high,
-            'fmri_lowfreq_sequence': low,
-            'fmri_ultralowfreq_sequence': ultralow,
+            'fmri_highfreq_sequence': high.T.float(),
+            'fmri_lowfreq_sequence': low.T.float(),
+            'fmri_ultralowfreq_sequence': ultralow.T.float(),
+            'valid_mask': valid,
             'subject': subj,
             'subject_name': subj_name,
             self.target: target,

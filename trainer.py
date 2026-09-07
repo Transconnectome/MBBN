@@ -23,12 +23,46 @@ import torch.distributed as dist
 from torch.nn import DataParallel
 import builtins
 
-#torch AMP
-from torch.cuda.amp import autocast
-from torch.cuda.amp import GradScaler
+#torch AMP  (device-generic API; falls back to the legacy one)
+_AMP_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+try:
+    from torch.amp import autocast as _autocast_impl, GradScaler as _GradScaler_impl
 
-# wandb
-import wandb
+    def autocast(enabled=True):
+        return _autocast_impl(_AMP_DEVICE, enabled=enabled)
+
+    def GradScaler(enabled=True):
+        return _GradScaler_impl(_AMP_DEVICE, enabled=enabled)
+except ImportError:                                     # torch < 2.4
+    from torch.cuda.amp import autocast as _autocast_impl
+    from torch.cuda.amp import GradScaler as _GradScaler_impl
+
+    def autocast(enabled=True):
+        return _autocast_impl(enabled=enabled)
+
+    def GradScaler(enabled=True):
+        return _GradScaler_impl(enabled=enabled)
+
+
+def _nvtx_push(tag):
+    # NVTX is a CUDA-build-only facility: calling it on a CPU wheel raises
+    # RuntimeError('NVTX functions not installed'), which made the released
+    # trainer impossible to smoke-test without a GPU.
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(tag)
+
+
+def _nvtx_pop():
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_pop()
+
+# wandb (optional: the pipeline must run without an account configured)
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:                                    # pragma: no cover
+    wandb = None
+    _HAS_WANDB = False
 
 # Import the time-series objects:
 from nitime.timeseries import TimeSeries
@@ -56,6 +90,9 @@ class Trainer():
         self.st_epoch = 1
         self.recent_pth = None
         self.state_dict = None
+        # actual path of the selected checkpoint; run_phase() used to *construct*
+        # a filename that save_checkpoint_() never writes
+        self.best_checkpoint_path = None
         self.transfer_learning = bool(self.pretrained_model_weights_path) or self.finetune
         # weightwatcher stuffs
         self.weightwatcher = kwargs.get('weightwatcher')
@@ -86,16 +123,26 @@ class Trainer():
         self.create_optimizer()
         if not self.weightwatcher:
             self.lr_handler.set_schedule(self.optimizer)
-            self.writer = Writer(sets, self.val_threshold, **kwargs)
-            self.sets = sets
-            
-        self.scaler = GradScaler() 
+
+        # AMP is only meaningful on CUDA; `--amp` now genuinely gates it.
+        self.amp = bool(getattr(self, 'amp', True)) and torch.cuda.is_available()
+        self.scaler = GradScaler(enabled=self.amp)
+        # restore optimizer/scaler/threshold BEFORE the Writer is constructed,
+        # so the recovered val_threshold is the one the Writer uses for testing
         self.load_optim_checkpoint()
 
+        if not self.weightwatcher:
+            self.writer = Writer(sets, self.val_threshold, **kwargs)
+            self.sets = sets
+
         #wandb
-        os.environ["WANDB_MODE"] = self.wandb_mode
-        wandb.init(project=self.wandb_project,entity=self.wandb_entity,reinit=True, name=self.experiment_title, config=kwargs)
-        wandb.watch(self.model,log='all',log_freq=10)
+        self.use_wandb = _HAS_WANDB and self.wandb_mode != 'disabled'
+        if self.use_wandb:
+            os.environ["WANDB_MODE"] = self.wandb_mode
+            wandb.init(project=self.wandb_project,entity=self.wandb_entity,reinit=True, name=self.experiment_title, config=kwargs)
+            wandb.watch(self.model,log='all',log_freq=10)
+        else:
+            os.environ["WANDB_MODE"] = "disabled"
         
         self.nan_list = []
         
@@ -104,13 +151,13 @@ class Trainer():
                 if loss_dict['is_active']:
                     print('using {} loss'.format(name))
                     setattr(self, name + '_loss_func', loss_dict['criterion'])
-            self.non_tensor_keys = 'subject_name'
+            self.non_tensor_keys = ('subject_name', 'subject', 'site')
             self.tensor_keys = None
     
     def _setup_tensor_keys(self, input_dict):
         if self.tensor_keys is None:
-            self.tensor_keys = [k for k in input_dict.keys() 
-                              if k not in self.non_tensor_keys]
+            self.tensor_keys = [k for k in input_dict.keys()
+                                if k not in self.non_tensor_keys]
             
     def _sort_pth_files(self, files_Path):
         file_name_and_time_lst = []
@@ -157,7 +204,8 @@ class Trainer():
             self.optimizer.load_state_dict(self.state_dict['optimizer_state_dict'])
             self.lr_handler.schedule.load_state_dict(self.state_dict['schedule_state_dict'])
             # self.optimizer.param_groups[0]['lr'] = self.state_dict['lr']
-            self.scaler.load_state_dict(self.state_dict['amp_state'])
+            if self.amp and self.state_dict.get('amp_state') is not None:
+                self.scaler.load_state_dict(self.state_dict['amp_state'])
             self.st_epoch = int(self.state_dict['epoch']) + 1
             self.best_loss = self.state_dict['loss_value']
             text = 'Training start from epoch {} and learning rate {}.'.format(self.st_epoch, self.optimizer.param_groups[0]['lr'])
@@ -204,11 +252,12 @@ class Trainer():
         elif self.task.lower() == 'mbbn_pretraining':
             self.model = Transformer_Reconstruction_Three_Channels(**self.kwargs)
         
-        # self.model = torch.compile(self.model, backend='inductor', mode='reduce-overhead', fullgraph=False)
-        
-        for name, module in self.model.named_children():
-            if "attention" not in name.lower():
-                module = torch.compile(module, mode='reduce-overhead')
+        # `for name, module in ...: module = torch.compile(module)` only rebound a
+        # local, so the released code never compiled anything. Opt in explicitly.
+        if getattr(self, 'compile_model', False):
+            for name, child in list(self.model.named_children()):
+                if "attention" not in name.lower():
+                    setattr(self.model, name, torch.compile(child, mode='reduce-overhead'))
         
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"Number of parameters of the model: {total_params}")
@@ -278,9 +327,15 @@ class Trainer():
                 metadata=None)
             sys.exit()
         
-        # Set up tensor keys using the first batch before the epoch loop
-        first_batch = next(iter(self.train_loader))
-        self._setup_tensor_keys(first_batch)
+        # Keys come from the dataset's own contract; fetching a batch here cost a
+        # full band decomposition (and a worker spawn) just to read dict keys.
+        ds = self.train_loader.dataset
+        while hasattr(ds, 'dataset'):
+            ds = ds.dataset
+        if hasattr(ds, 'item_keys'):
+            self._setup_tensor_keys({k: None for k in ds.item_keys()})
+        else:
+            self._setup_tensor_keys(next(iter(self.train_loader)))
 
         for epoch in range(self.st_epoch, self.nEpochs + 1):
             start = time.time()
@@ -305,7 +360,11 @@ class Trainer():
 
     def _handle_regular_epoch(self, epoch):
         self.eval_epoch('val')
-        self.eval_epoch('test')
+        # Selection happens on validation only. Scoring the test set every epoch
+        # is what allows a run to be chosen on test performance after the fact;
+        # opt in with --eval_test_every_epoch if you want the curve.
+        if getattr(self, 'eval_test_every_epoch', False):
+            self.eval_epoch('test')
         print(f'\n______epoch summary {epoch}/{self.nEpochs}_____\n')
         self._update_metrics(epoch)
 
@@ -319,7 +378,8 @@ class Trainer():
         self.writer.save_history_to_csv()
 
         if self.rank == 0:
-            self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
+            if getattr(self, 'use_wandb', False):
+                self.writer.register_wandb(epoch, lr=self.optimizer.param_groups[0]['lr'])
             self.save_checkpoint_(epoch, len(self.train_loader), self.scaler)
         
     def train_epoch(self, epoch):
@@ -330,56 +390,59 @@ class Trainer():
         self._monitor_cuda_memory()
         print("Starting iteration...")
 
+        self.optimizer.zero_grad(set_to_none=True)
         for batch_idx, input_dict in enumerate(tqdm(self.train_loader, position=0, leave=True)):
             self._train_step(batch_idx, input_dict)
 
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _monitor_cuda_memory(self):
         if torch.cuda.is_available():
             max_allocated = torch.cuda.max_memory_allocated()
-            max_cached = torch.cuda.max_memory_cached()
+            max_cached = torch.cuda.max_memory_reserved()   # max_memory_cached is deprecated
             print(f"max allocated memory: {max_allocated / (1024 * 1024):.2f} MB")
             print(f"max cached memory: {max_cached / (1024 * 1024):.2f} MB")
         else:
             print("no cuda device")
 
     def _train_step(self, batch_idx, input_dict):
-        torch.cuda.nvtx.range_push("training steps")
+        _nvtx_push("training steps")
         self.writer.total_train_steps += 1
-        self.optimizer.zero_grad()
 
         skip_lr_sched = False
+        stepped = False
 
         if self.amp:
-            skip_lr_sched = self._train_step_amp(batch_idx, input_dict)
+            skip_lr_sched, stepped = self._train_step_amp(batch_idx, input_dict)
         else:
-            self._train_step_normal(input_dict)
+            stepped = self._train_step_normal(batch_idx, input_dict)
 
-        if not skip_lr_sched:
+        # the schedule is per-optimizer-step, so only advance it when one happened
+        if stepped and not skip_lr_sched:
             self.lr_handler.schedule_check_and_update(self.optimizer)
 
-        torch.cuda.nvtx.range_pop()
+        _nvtx_pop()
 
     def _train_step_amp(self, batch_idx, input_dict):
-        torch.cuda.nvtx.range_push("forward pass")
-        with autocast():
+        _nvtx_push("forward pass")
+        with autocast(enabled=self.amp):
             loss_dict, loss = self.forward_pass(input_dict)
-        torch.cuda.nvtx.range_pop()
+        _nvtx_pop()
 
         loss = loss / self.accumulation_steps
 
-        torch.cuda.nvtx.range_push("backward pass")
+        _nvtx_push("backward pass")
         self.scaler.scale(loss).backward()
-        torch.cuda.nvtx.range_pop()
+        _nvtx_pop()
 
-        skip_lr_sched = False
+        skip_lr_sched, stepped = False, False
         if (batch_idx + 1) % self.accumulation_steps == 0:
             if self.gradient_clipping:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    max_norm=1, 
+                    self.model.parameters(),
+                    max_norm=self.clip_max_norm,      # --clip_max_norm was ignored
                     error_if_nonfinite=False
                 )
 
@@ -387,15 +450,26 @@ class Trainer():
             scale = self.scaler.get_scale()
             self.scaler.update()
             skip_lr_sched = (scale > self.scaler.get_scale())
+            self.optimizer.zero_grad(set_to_none=True)
+            stepped = True
 
         self.writer.write_losses(loss_dict, set='train')
-        return skip_lr_sched
+        return skip_lr_sched, stepped
 
-    def _train_step_normal(self, input_dict):
+    def _train_step_normal(self, batch_idx, input_dict):
         loss_dict, loss = self.forward_pass(input_dict)
-        loss.backward()
-        self.optimizer.step()
+        (loss / self.accumulation_steps).backward()
+        stepped = False
+        if (batch_idx + 1) % self.accumulation_steps == 0:
+            if self.gradient_clipping:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=self.clip_max_norm,
+                    error_if_nonfinite=False)
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            stepped = True
         self.writer.write_losses(loss_dict, set='train')
+        return stepped
                 
     def eval_epoch(self,set):
         loader = self.val_loader if set == 'val' else self.test_loader
@@ -405,7 +479,7 @@ class Trainer():
         self.eval(set)
         with torch.no_grad():
             for batch_idx, input_dict in enumerate(tqdm(loader, position=0, leave=True)):
-                with autocast():
+                with autocast(enabled=self.amp):
                     loss_dict, _ = self.forward_pass(input_dict)
                 self.writer.write_losses(loss_dict, set=set)
         
@@ -425,7 +499,9 @@ class Trainer():
         # Transfer all tensors to GPU in one shot
         if self.cuda:
             for k in self.tensor_keys:
-                input_dict[k] = input_dict[k].cuda(non_blocking=True)
+                v = input_dict.get(k)
+                if torch.is_tensor(v):
+                    input_dict[k] = v.cuda(non_blocking=True)
 
         # Run the pre-determined forward function
         output_dict = self._forward_func(input_dict)
@@ -438,10 +514,15 @@ class Trainer():
         return loss_dict, loss
 
     def _setup_forward_func(self):
+        # `valid_mask` marks real timepoints; zero-padded ones (ABIDE/ABCD padded
+        # up to the pretraining length) must not be attended over.
         if self.fmri_type == 'divided_timeseries':
-            self._forward_func = lambda x: self.model(x['fmri_highfreq_sequence'], x['fmri_lowfreq_sequence'], x['fmri_ultralowfreq_sequence'])
+            self._forward_func = lambda x: self.model(
+                x['fmri_highfreq_sequence'], x['fmri_lowfreq_sequence'],
+                x['fmri_ultralowfreq_sequence'], valid_mask=x.get('valid_mask'))
         else:
-            self._forward_func = lambda x: self.model(x['fmri_sequence'])
+            self._forward_func = lambda x: self.model(
+                x['fmri_sequence'], valid_mask=x.get('valid_mask'))
     
  
 
@@ -451,18 +532,35 @@ class Trainer():
         for loss_name, current_loss_dict in self.writer.losses.items():
             if current_loss_dict['is_active']:
                 loss_func = getattr(self, 'compute_' + loss_name)
-                torch.cuda.nvtx.range_push(f"{loss_name}")
+                _nvtx_push(f"{loss_name}")
                 current_loss_value = loss_func(input_dict,output_dict)
                 
                 if current_loss_value.isnan().sum() > 0:
                     warnings.warn('found nans in computation')
                     print('at {} loss'.format(loss_name))
-                    
+                    if getattr(self, 'nan_policy', 'warn') == 'raise':
+                        raise FloatingPointError(
+                            f'NaN in {loss_name} loss at train step '
+                            f'{self.writer.total_train_steps}. Run with '
+                            f'--nan_policy warn to reproduce the published '
+                            f'behaviour of continuing regardless.')
+
                     if self.target != 'reconstruction':
                         self.nan_list+=np.array(input_dict['subject_name'])[(output_dict[self.fine_tune_task].reshape(output_dict[self.fine_tune_task].shape[0],-1).isnan().sum(axis=1).detach().cpu().numpy() > 0)].tolist()
                         print('current_nan_list:', self.nan_list)
                     
                 lamda = current_loss_dict['factor']
+                # The band-repulsion gradient scales as 1/S and S is smallest at
+                # initialisation, when the three maps still agree. Ramping lambda
+                # keeps that transient from dominating the first updates.
+                # Only ramp while training: an evaluation-only Trainer starts at
+                # total_train_steps == 0, which would scale the reported loss to
+                # zero and make it look inert.
+                if (loss_name == 'spatial_difference'
+                        and getattr(self, 'spatial_loss_warmup', 0)
+                        and getattr(self, 'mode', 'train') == 'train'):
+                    warm = float(self.spatial_loss_warmup)
+                    lamda = lamda * min(1.0, self.writer.total_train_steps / warm)
                 factored_loss = current_loss_value * lamda
                 final_loss_dict[loss_name] = factored_loss.item()
                 final_loss_value += factored_loss
@@ -539,14 +637,20 @@ class Trainer():
         val_AUROC = self.get_last_AUROC()
         val_MAE = self.get_last_MAE()
         val_threshold = self.get_last_val_threshold()
-        title = str(self.writer.experiment_title) + '_epoch_' + str(int(epoch))
+        # `title` used to carry the epoch, so each improvement wrote a fresh
+        # ~325 MB checkpoint rather than replacing the previous best.
+        title = str(self.writer.experiment_title)
+        if getattr(self, 'keep_all_best_checkpoints', False):
+            title = title + '_epoch_' + str(int(epoch))
         directory = self.writer.experiment_folder
 
         # Create directory to save to
         if not os.path.exists(directory):
             os.makedirs(directory)
-        if self.amp:
-            amp_state = scaler.state_dict()
+        # `amp_state` used to be referenced unconditionally while only being
+        # assigned under `if self.amp:`, so saving with AMP disabled raised
+        # NameError on the first epoch.
+        amp_state = scaler.state_dict() if self.amp else None
 
         # Build checkpoint dict to save.
         ckpt_dict = {
@@ -554,7 +658,8 @@ class Trainer():
             'optimizer_state_dict':self.optimizer.state_dict() if self.optimizer is not None else None,
             'epoch':epoch,
             'loss_value':loss,
-            'amp_state': amp_state}
+            'amp_state': amp_state,
+            'val_threshold': val_threshold}
 
         # if val_ACC is not None:
         #     ckpt_dict['val_ACC'] = val_ACC
@@ -568,6 +673,9 @@ class Trainer():
             ckpt_dict['schedule_state_dict'] = self.lr_handler.schedule.state_dict()
             ckpt_dict['lr'] = self.optimizer.param_groups[0]['lr']
             print(f"current_lr:{self.optimizer.param_groups[0]['lr']}")
+        # a run whose validation metric never improves wrote no checkpoint at
+        # all and so could not be resumed
+        torch.save(ckpt_dict, os.path.join(directory, f'{title}_last_epoch.pth'))
         if hasattr(self,'loaded_model_weights_path'):
             ckpt_dict['loaded_model_weights_path'] = self.loaded_model_weights_path
         
@@ -577,6 +685,7 @@ class Trainer():
                 self.best_AUROC = val_AUROC
                 name = "{}_BEST_val_AUROC.pth".format(title)
                 torch.save(ckpt_dict, os.path.join(directory, name))
+                self.best_checkpoint_path = os.path.join(directory, name)
                 print(f'updating best saved model with AUROC:{val_AUROC}')
 
                 if self.best_ACC < val_ACC:
@@ -595,6 +704,7 @@ class Trainer():
                 self.best_MAE = val_MAE
                 name = "{}_BEST_val_MAE.pth".format(title)
                 torch.save(ckpt_dict, os.path.join(directory, name))
+                self.best_checkpoint_path = os.path.join(directory, name)
                 print(f'updating best saved model with MAE: {val_MAE}')
             else:
                 pass
@@ -604,6 +714,7 @@ class Trainer():
                 self.best_loss = loss
                 name = "{}_BEST_val_loss.pth".format(title)
                 torch.save(ckpt_dict, os.path.join(directory, name))
+                self.best_checkpoint_path = os.path.join(directory, name)
                 print(f'updating best saved model with loss: {loss}')
             else:
                 pass
@@ -618,17 +729,23 @@ class Trainer():
         fmri_ultralowfreq_sequence = input_dict['fmri_ultralowfreq_sequence']
 
         mask_loss_high = self.mask_loss_func(fmri_highfreq_sequence,
-                                             output_dict['mask_spatiotemporal_high_fmri_sequence'])
+                                             output_dict['mask_spatiotemporal_high_fmri_sequence'],
+                                             output_dict.get('mask_high'))
         mask_loss_low = self.mask_loss_func(fmri_lowfreq_sequence,
-                                            output_dict['mask_spatiotemporal_low_fmri_sequence'])
+                                            output_dict['mask_spatiotemporal_low_fmri_sequence'],
+                                            output_dict.get('mask_low'))
         mask_loss_ultralow = self.mask_loss_func(fmri_ultralowfreq_sequence,
-                                                 output_dict['mask_spatiotemporal_ultralow_fmri_sequence'])
+                                                 output_dict['mask_spatiotemporal_ultralow_fmri_sequence'],
+                                                 output_dict.get('mask_ultralow'))
         return mask_loss_high + mask_loss_low + mask_loss_ultralow
         
         
     def compute_binary_classification(self,input_dict,output_dict):
         binary_loss = self.binary_classification_loss_func(output_dict['binary_classification'].squeeze(), input_dict[self.target].squeeze().float()) # BCEWithLogitsLoss
         if torch.sum(torch.isnan(binary_loss)):
+            if getattr(self, 'nan_policy', 'warn') == 'raise':
+                raise FloatingPointError('NaN in the binary classification loss')
+            # published behaviour: substitute 0, which hides the failure
             binary_loss = torch.nan_to_num(binary_loss, nan=0.0)
         return binary_loss
 
@@ -643,9 +760,11 @@ class Trainer():
         out = output_dict[task].detach().clone().cpu()
         score = out.squeeze() if out.shape[0] > 1 else out
         labels = input_dict[self.target].clone().cpu() # input_dict['subject_' + task].clone().cpu()
-        subjects = input_dict['subject'].clone().cpu()
+        subjects = input_dict['subject']
+        if torch.is_tensor(subjects):
+            subjects = subjects.clone().cpu()
         for i, subj in enumerate(subjects):
-            subject = str(subj.item())
+            subject = str(subj.item()) if torch.is_tensor(subj) else str(subj)
             if subject not in self.writer.subject_accuracy:
                 self.writer.subject_accuracy[subject] = {'score': score[i].unsqueeze(0), 'mode': self.mode, 'truth': labels[i],'count': 1}
             else:

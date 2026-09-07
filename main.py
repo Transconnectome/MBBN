@@ -1,6 +1,8 @@
 from utils import *  # including 'init_distributed', 'weight_loader'
 from trainer import Trainer
 import os
+import sys
+import torch
 from pathlib import Path
 
 
@@ -70,7 +72,7 @@ def get_arguments(base_path):
 
     # ── W&B logging ─────────────────────────────────────────────────────────
     parser.add_argument('--wandb_mode', default='online',
-                        choices=['online', 'offline'])
+                        choices=['online', 'offline', 'disabled'])
     parser.add_argument('--wandb_entity', default='', type=str)
     parser.add_argument('--wandb_project', default='MBBN', type=str)
 
@@ -119,7 +121,10 @@ def get_arguments(base_path):
     parser.add_argument('--lr_gamma_phase3', type=float, default=0.97)
     parser.add_argument('--lr_step_phase3', type=int, default=3000)
     parser.add_argument('--lr_warmup_phase3', type=int, default=500)
-    parser.add_argument('--sequence_length_phase4', type=int, default=464)
+    # NOTE: this used to be `--sequence_length_phase4` inside the phase-3
+    # block, so sort_args('3', ...) discarded it and pretraining silently ran at
+    # the phase-3 default. pretrain_MBBN.slurm passed 464 and got 348.
+    parser.add_argument('--sequence_length_phase3', type=int, default=464)
     parser.add_argument('--workers_phase3', type=int, default=4)
     # num_hub_ROIs: top-k high-communicability nodes to mask (default 380 for Schaefer 400)
     parser.add_argument('--num_hub_ROIs', type=int, default=380)
@@ -136,10 +141,89 @@ def get_arguments(base_path):
     parser.add_argument('--lr_gamma_phase4', type=float, default=0.9)
     parser.add_argument('--lr_step_phase4', type=int, default=3000)
     parser.add_argument('--lr_warmup_phase4', type=int, default=100)
-    parser.add_argument('--sequence_length_phase3', type=int, default=348)
+    parser.add_argument('--sequence_length_phase4', type=int, default=464)
     parser.add_argument('--workers_phase4', type=int, default=4)
 
+    # ── Hardening options (see docs/audit/AUDIT.md) ─────────────────────────
+    # Every default below reproduces the published behaviour EXCEPT where the
+    # published behaviour is a defect; those are marked (changed).
+    hard = parser.add_argument_group('hardening')
+    hard.add_argument('--head_type', choices=['published', 'linear', 'mlp'], default='linear',
+                      help='(changed) prediction head. "published" = Linear->BatchNorm1d(1)'
+                           '->Dropout(0.6) on the final logit, which makes a subject\'s '
+                           'prediction depend on its batch-mates and zeroes 61%% of training '
+                           'logits. "linear" is a plain read-out.')
+    hard.add_argument('--head_dropout', type=float, default=0.6)
+    hard.add_argument('--spat_diff_loss_type', default='minus_log',
+                      choices=['minus_log', 'minus_log_eps', 'neg_linear', 'cosine'],
+                      help='band-repulsion form. "minus_log" is published: unbounded, '
+                           'singular where the three maps agree, and its global optimum is '
+                           'one-hot (hub) attention rows.')
+    hard.add_argument('--spat_diff_eps', type=float, default=1e-4)
+    hard.add_argument('--spat_diff_entropy_weight', type=float, default=0.0,
+                      help='penalise low-entropy attention rows, counteracting hub collapse')
+    hard.add_argument('--spatial_loss_warmup', type=int, default=0,
+                      help='linearly ramp spatial_loss_factor over this many optimizer steps')
+    hard.add_argument('--band_embedding', action='store_true',
+                      help='learned additive band identity for the shared temporal encoder')
+    hard.add_argument('--spatial_head', action='store_true',
+                      help='put the band-specific spatial attention maps on the prediction '
+                           'path. Without this d(prediction)/d(spatial attention) is exactly '
+                           '0, so those maps carry no label gradient and cannot be attributed.')
+    hard.add_argument('--attn_only', action='store_true',
+                      help='drop the unused value projection in the spatial attention')
+    hard.add_argument('--use_padding_mask', action='store_true', default=True,
+                      help='(changed) exclude zero-padded timepoints from attention')
+    hard.add_argument('--no_padding_mask', dest='use_padding_mask', action='store_false')
+    hard.add_argument('--pretrained_sequence_length', type=int, default=None,
+                      help='sequence length the pretrained checkpoint was trained at; '
+                           'replaces the hard-coded 464')
+    # masked pretraining
+    hard.add_argument('--random_mask', action='store_true',
+                      help='resample the spatial/temporal mask per subject per epoch. The '
+                           'published mask is identical for every subject and every epoch.')
+    hard.add_argument('--mask_ratio_spatial', type=float, default=None,
+                      help='fraction of ROIs to hide (default: num_hub_ROIs/intermediate_vec, '
+                           'i.e. 380/400 = 95%% as released)')
+    hard.add_argument('--mask_ratio_temporal', type=float, default=None)
+    hard.add_argument('--mask_loss_on_masked_only', action='store_true',
+                      help='score reconstruction only where the input was hidden')
+    hard.add_argument('--communicability_dir', default=None)
+    hard.add_argument('--communicability_dataset', default='UKB')
+    # data pipeline
+    hard.add_argument('--cache_bands', action='store_true',
+                      help='memoise the per-subject knee fit + band filtering to disk; the '
+                           'released code repeats it every epoch')
+    hard.add_argument('--band_cache_dir', default=None)
+    # splitting / evaluation protocol
+    hard.add_argument('--split_seed', type=int, default=None,
+                      help='seed for the train/val/test partition; defaults to --seed')
+    hard.add_argument('--site_stratify', action='store_true',
+                      help='stratify the split on target x acquisition site')
+    hard.add_argument('--group_by_family', action='store_true',
+                      help='keep siblings/twins (ABCD) within a single fold')
+    hard.add_argument('--leave_one_site_out', default=None,
+                      help='assign this site entirely to the test fold')
+    hard.add_argument('--eval_test_every_epoch', action='store_true',
+                      help='score the test set every epoch (published behaviour). Off by '
+                           'default: selection uses validation only.')
+    hard.add_argument('--skip_final_test', action='store_true',
+                      help='do not evaluate the selected checkpoint on the test fold')
+    hard.add_argument('--pos_weight', type=float, default=None,
+                      help='BCEWithLogitsLoss pos_weight for imbalanced targets')
+    hard.add_argument('--nan_policy', choices=['warn', 'raise'], default='warn',
+                      help='(published: warn) "raise" stops instead of substituting 0 for a '
+                           'NaN loss and continuing on a corrupted objective')
+    hard.add_argument('--deterministic', action='store_true')
+    hard.add_argument('--compile_model', action='store_true')
+    hard.add_argument('--keep_all_best_checkpoints', action='store_true',
+                      help='published behaviour: one file per improving epoch (~325 MB each)')
+
     args = parser.parse_args()
+    # remember what the user actually typed, so sort_args can warn about options
+    # that belong to a different phase and would be silently discarded
+    args._explicit = {a.lstrip('-').replace('-', '_').split('=')[0]
+                      for a in sys.argv[1:] if a.startswith('--')}
 
     # Standard MBBN settings — not user-adjustable
     args.fmri_type = 'divided_timeseries'
@@ -149,7 +233,6 @@ def get_arguments(base_path):
     args.seq_part = 'head'
     args.use_high_freq = True
     args.spatiotemporal = True
-    args.spat_diff_loss_type = 'minus_log'
     args.attn_mask = True
     # Pretraining masking settings (step 3)
     args.use_mask_loss = True
@@ -159,7 +242,7 @@ def get_arguments(base_path):
     args.temporal_masking_type = 'time_window'
     args.temporal_masking_window_size = 20
     args.window_interval_rate = 2
-    args.cuda = True
+    args.cuda = torch.cuda.is_available()
 
     return args
 
@@ -185,21 +268,22 @@ def run_phase(args, loaded_model_weights_path, phase_num, phase_name):
     print(f'Saving results to {args.experiment_folder}')
     args_logger(args)
 
-    kwargs = sort_args(phase_num, vars(args))
+    kwargs = sort_args(phase_num, vars(args), explicit=getattr(args, '_explicit', None))
     reproducibility(**kwargs)
 
     trainer = Trainer(sets=['train', 'val', 'test'], **kwargs)
     trainer.training()
 
-    if phase_num == '3' and not args.fine_tune_task == 'regression':
-        critical_metric = 'accuracy'
-    else:
-        critical_metric = 'loss'
-
-    model_weights_path = os.path.join(
-        trainer.writer.experiment_folder,
-        trainer.writer.experiment_title + '_BEST_val_{}.pth'.format(
-            critical_metric))
+    # The released code assembled '<title>_BEST_val_loss.pth' (or '..._accuracy'),
+    # but save_checkpoint_ writes '<title>_epoch_<n>_BEST_val_AUROC|MAE|loss.pth',
+    # so the returned path never existed. Report what was actually written.
+    model_weights_path = trainer.best_checkpoint_path
+    if model_weights_path is None:
+        model_weights_path = os.path.join(
+            trainer.writer.experiment_folder,
+            trainer.writer.experiment_title + '_last_epoch.pth')
+        print('validation never improved; falling back to the last-epoch checkpoint')
+    print(f'selected checkpoint: {model_weights_path}')
     return model_weights_path
 
 
@@ -216,15 +300,19 @@ def test(args, phase_num, model_weights_path):
     args.experiment_title = experiment_folder.name
     args_logger(args)
 
-    kwargs = sort_args(args.step, vars(args))
+    kwargs = sort_args(args.step, vars(args), explicit=getattr(args, '_explicit', None))
+    reproducibility(**kwargs)
     trainer = Trainer(sets=['test'], **kwargs)
     trainer.testing()
+    return trainer
 
 
 if __name__ == '__main__':
-    base_path = os.getcwd()
-    setup_folders(base_path)
-    args = get_arguments(base_path)
+    args = get_arguments(os.getcwd())
+    # setup_folders() used to run against the cwd before parsing, so --base_path
+    # only half-applied: splits/experiments were read from base_path but the
+    # directories were created next to wherever the job happened to start.
+    setup_folders(args.base_path)
 
     init_distributed(args)
     model_weights_path, step, task = weight_loader(args)
@@ -233,5 +321,11 @@ if __name__ == '__main__':
         test(args, '4', model_weights_path)
     else:
         print(f'Starting phase {step}: {task}')
-        run_phase(args, model_weights_path, step, task)
+        best = run_phase(args, model_weights_path, step, task)
         print(f'Finished phase {step}: {task}')
+        # Select on validation, then score the held-out fold exactly once with
+        # the validation operating point. Scoring test every epoch (published
+        # behaviour) is available via --eval_test_every_epoch.
+        if step in ('1', '2') and not args.skip_final_test and best and os.path.exists(best):
+            print('Evaluating the selected checkpoint on the held-out test fold')
+            test(args, step, best)

@@ -1,6 +1,8 @@
 from sklearn.metrics import balanced_accuracy_score as bac
 from sklearn.metrics import roc_curve,roc_auc_score, r2_score, f1_score, recall_score
+from sklearn.metrics import average_precision_score
 import numpy as  np
+import warnings
 
 
 class Metrics():
@@ -18,8 +20,21 @@ class Metrics():
         auroc_score = roc_auc_score(truth, pred)
         return auroc_score
 
+    def AUPRC(self,truth,pred):
+        # average precision: the summary that stays informative at low prevalence
+        return average_precision_score(truth, pred)
+
     def ROC_CURVE(self,truth,pred,name,val_threshold):
+        truth = np.asarray(truth)
+        pred = np.asarray(pred, dtype=float)
         if name == 'test':
+            if not np.isfinite(val_threshold) or not (0.0 < float(val_threshold) < 1.0):
+                warnings.warn(
+                    'test-set operating point is {!r}, which is outside (0,1) for '
+                    'sigmoid outputs; every subject will fall on one side of it and '
+                    'sensitivity/specificity/f1/best_bal_acc will be degenerate. '
+                    'This happens when the validation threshold was never carried '
+                    'over.'.format(val_threshold), RuntimeWarning, stacklevel=2)
             print(f'using loaded threshold - {val_threshold} - for testing')
             best_threshold = val_threshold
             #best_threshold = 0.5
@@ -46,8 +61,8 @@ class Metrics():
             best_gmean = gmeans[ix]
             best_specificity = 1-fpr[ix]
             best_sensitivity = tpr[ix]
-            best_f1_score = f1_score(truth, pred>best_threshold)
-            best_acc_score = self.BAC(truth, pred>best_threshold)
+            best_f1_score = f1_score(truth, pred > best_threshold)
+            best_acc_score = self.BAC(truth, pred > best_threshold)
         #print('Best Threshold={}, G-Mean={}, speicificity={}, sensitivity={}, f1_score={}'.format(best_threshold, gmeans[ix], 1-fpr[ix], tpr[ix], best_f1_score))
         return best_acc_score, best_threshold, best_gmean, best_specificity, best_sensitivity, best_f1_score
 

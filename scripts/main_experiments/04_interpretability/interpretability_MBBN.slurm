@@ -31,8 +31,20 @@ SPATIAL_LOSS_FACTOR=10.0
 # Path to the trained model checkpoint
 MODEL_PATH="/path/to/trained_model.pth"
 
-# Output directory for GradCAM attention maps
+# Output directory for attribution maps
 SAVE_DIR="./visualization/${DATASET}_${TARGET}_seed${SEED}"
+
+# ── Attribution mode (docs/audit/AUDIT.md) ───────────────────────────────────
+# `spatial_difference` reproduces the published maps: it backpropagates the
+# band-repulsion loss, whose gradient is quantised to {-2,-1,0,1,2}/(numel*S)
+# -- a handful of distinct values, 33% of them exactly zero -- and carries no
+# label information. The diagnosis enters only via which subjects are averaged.
+#
+# `label_gradient` attributes the model's own decision variable, which requires
+# the maps to be ON the prediction path: train with --spatial_head, otherwise
+# d(prediction)/d(spatial attention) is exactly 0 and every value would be 0.
+ATTRIBUTION=label_gradient       # label_gradient | spatial_difference
+N_PERMUTATIONS=1000              # label-permutation null for group differences
 
 # ── Environment ──────────────────────────────────────────────────────────────
 source /usr/anaconda3/etc/profile.d/conda.sh
@@ -51,4 +63,10 @@ python visualization.py \
     --model_path ${MODEL_PATH} \
     --save_dir ${SAVE_DIR} \
     --seed ${SEED} \
-    --wandb_mode offline
+    --attribution ${ATTRIBUTION} \
+    --n_permutations ${N_PERMUTATIONS} \
+    --spatial_head \
+    --head_type linear \
+    --confidence_margin 0.1 \
+    --cache_bands \
+    --wandb_mode disabled

@@ -230,6 +230,95 @@ MBBN/
 
 ---
 
+---
+
+## Audit and hardening (2026-09)
+
+This tree carries a code audit and a hardening patch on top of the published release.
+**35 findings** — 7 that prevent the released code from running at all, 9 that change
+reported numbers or their interpretation — with a **58-test regression suite** and
+**20 new flags**. Full detail, including the measurements behind each claim:
+[`docs/audit/AUDIT.md`](docs/audit/AUDIT.md).
+
+<p align="center">
+  <img src="docs/audit/audit_infographic.png" width="900" alt="Audit summary"/>
+</p>
+
+### The three findings that bear on published claims
+
+1. **The interpreted attention maps carry no label information.** The band-specific
+   spatial-attention maps are computed but never enter the prediction, so
+   `d(prediction)/d(spatial qkv)` is exactly `0` for all three bands. Their only training
+   signal is the band-repulsion loss — which `visualization.py` then backpropagates to
+   produce the saliency, giving a quantity with five discrete values (33% exactly 0) and no
+   dependence on the diagnosis. `--spatial_head` connects them; `--attribution
+   label_gradient` attributes the model's own decision.
+2. **Reported operating-point metrics are prevalence-determined constants.** The validation
+   threshold never reaches the test set, so sigmoid outputs are cut at 0: sensitivity 1.000,
+   specificity 0.000, balanced accuracy 0.500, F1 = 2p/(1+p), regardless of the model.
+   AUROC is unaffected.
+3. **The band-repulsion objective is optimised by hub attention.** `S <= 6/N`, attained
+   only when every attention row is one-hot, so `-log S` is minimised by star/hub attention
+   independently of the data — and is singular at initialisation, where its gradient scales
+   as `1/S`.
+
+<p align="center">
+  <img src="docs/audit/audit_evidence.png" width="820" alt="Numerical evidence"/>
+</p>
+
+### Reproducing the published behaviour
+
+Defaults reproduce released behaviour **except** where that behaviour is itself the defect
+(the test operating point, the dropped evaluation subjects, the mis-tagged pretraining flag,
+and the seven blocking bugs). Everything else is reversible:
+
+```bash
+python main.py --step 2 \
+    --spat_diff_loss_type minus_log \   # the published -log(S) objective, verbatim
+    --head_type published \             # Linear -> BatchNorm1d(1) -> Dropout(0.6)
+    --nan_policy zero \                 # substitute 0 for NaN and continue
+    --eval_test_every_epoch \           # score the test fold every epoch
+    --keep_all_best_checkpoints \       # one checkpoint file per improving epoch
+    --no_padding_mask                  # attention_mask=None, as released
+```
+
+### Recommended settings
+
+```bash
+python main.py --step 2 --dataset_name ABIDE --target ASD \
+    --fine_tune_task binary_classification \
+    --head_type linear \                     # no BatchNorm/Dropout on the scalar logit
+    --spat_diff_loss_type minus_log_eps \    # bounded; no 1/S singularity at init
+    --spatial_loss_warmup 500 \              # ramp lambda past the initial transient
+    --spatial_head --band_embedding \        # maps attributable; bands distinguishable
+    --site_stratify --group_by_family \      # balance site, keep relatives in one fold
+    --split_seed 0 --seed 1 \                # partition independent of weight init
+    --nan_policy raise --cache_bands
+```
+
+### Tests
+
+```bash
+python -m pytest tests -q      # 58 tests, no cohort data / GPU / W&B account needed
+```
+
+`tests/fixtures/synthetic.py` generates an ABIDE-shaped cohort (AR(1) parcel time series
+with a weak class-dependent component, both metadata CSVs, a communicability hub order), so
+the suite — including an end-to-end `main.py` run — is self-contained. Also validated on an
+NVIDIA GB10 inside the NGC PyTorch container: 58/58 tests, plus short step-2 runs with mixed
+precision on and off and a step-3 masked-pretraining run.
+
+### New flags
+
+| group | flags |
+|---|---|
+| Training safety | `--spat_diff_loss_type` `--spat_diff_entropy_weight` `--spatial_loss_warmup` `--nan_policy` `--pos_weight` |
+| Evaluation protocol | `--site_stratify` `--group_by_family` `--leave_one_site_out` `--split_seed` `--eval_test_every_epoch` `--skip_final_test` |
+| Interpretability | `--attribution` `--n_permutations` `--spatial_head` `--confidence_margin` |
+| Model | `--head_type` `--head_dropout` `--band_embedding` `--attn_only` `--use_padding_mask` / `--no_padding_mask` `--pretrained_sequence_length` |
+| Pretraining | `--random_mask` `--mask_ratio_spatial` `--mask_ratio_temporal` `--mask_loss_on_masked_only` `--communicability_dir` `--communicability_dataset` |
+| Runtime | `--cache_bands` `--band_cache_dir` `--deterministic` `--compile_model` `--keep_all_best_checkpoints` |
+
 ## Citation
 
 If you find this work useful, please cite:

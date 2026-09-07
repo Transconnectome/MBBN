@@ -9,7 +9,10 @@ from itertools import zip_longest
 from metrics import Metrics
 import torch
 
-import wandb
+try:
+    import wandb
+except ImportError:                                    # pragma: no cover
+    wandb = None
 import time
 
 class Writer():
@@ -45,7 +48,7 @@ class Writer():
         self.tensorboard_dir = Path(os.path.join(self.log_dir, self.experiment_title))
         self.csv_path = os.path.join(self.experiment_folder, 'history')
         os.makedirs(self.csv_path, exist_ok=True)
-        if self.task == 'fine_tune' or 'bert' or 'test':
+        if self.task in ('fine_tune', 'vanilla_BERT', 'MBBN', 'test'):
             self.per_subject_predictions = os.path.join(self.experiment_folder, 'per_subject_predictions')
             os.makedirs(self.per_subject_predictions, exist_ok=True)
 
@@ -117,6 +120,10 @@ class Writer():
                 metrics[name + '_Regular_Accuracy'] = self.metrics.RAC(truth,[x>0.5 for x in torch.Tensor(pred)]) # Stella modified it
                 metrics[name + '_AUROC'] = self.metrics.AUROC(truth,pred)
                 metrics[name +'_best_bal_acc'], metrics[name + '_best_threshold'],metrics[name + '_gmean'],metrics[name + '_specificity'],metrics[name + '_sensitivity'],metrics[name + '_f1_score'] = self.metrics.ROC_CURVE(truth,pred,name,self.val_threshold)
+                if name == 'val':
+                    # carry the validation operating point over to the test set;
+                    # without this the test threshold stays at its init value
+                    self.val_threshold = metrics[name + '_best_threshold']
             self.current_metrics = metrics
             
             
@@ -149,7 +156,8 @@ class Writer():
                     wandb_result[f'{title}_loss_history'] = getattr(self,title + '_loss_history')[-1]
         #accuracy
         wandb_result.update(self.current_metrics)
-        wandb.log(wandb_result)
+        if wandb is not None:
+            wandb.log(wandb_result)
 
     def write_losses(self,final_loss_dict,set):
         for loss_name,loss_value in final_loss_dict.items():
@@ -165,9 +173,13 @@ class Writer():
         self.kwargs = kwargs
 
     def register_losses(self, **kwargs):
+        pos_weight = kwargs.get('pos_weight')
+        bce_kwargs = {}
+        if pos_weight is not None and float(pos_weight) > 0:
+            bce_kwargs['pos_weight'] = torch.tensor(float(pos_weight))
         self.losses = {
             'mask': {'is_active': False, 'criterion': Mask_Loss(**kwargs), 'factor': 1},
-            'binary_classification': {'is_active': False, 'criterion': BCEWithLogitsLoss(), 'factor': 1},
+            'binary_classification': {'is_active': False, 'criterion': BCEWithLogitsLoss(**bce_kwargs), 'factor': 1},
             'regression': {'is_active': False, 'criterion': L1Loss(), 'factor': 1},
             'spatial_difference': {'is_active': False, 'criterion': Spatial_Difference_Loss(**kwargs), 'factor': self.spatial_loss_factor}
         }

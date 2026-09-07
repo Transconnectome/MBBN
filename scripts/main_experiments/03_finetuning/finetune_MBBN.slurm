@@ -32,6 +32,19 @@ SPATIAL_LOSS_FACTOR=100.0
 # Pretrained weights (from step 3 pretraining)
 PRETRAINED_WEIGHTS="/path/to/pretrained_model.pth"
 
+# Sequence length the pretrained checkpoint was ACTUALLY trained at. The
+# released code hard-coded 464 here (`self.sequence_length += (464 - ...)`),
+# so a checkpoint trained at any other length failed to load: position
+# embeddings were skipped silently and the spatial qkv raised RuntimeError.
+PRETRAINED_SEQ_LEN=464
+
+HARDENING="--head_type linear --spat_diff_loss_type neg_linear \
+    --spatial_loss_warmup 500 --spatial_head --band_embedding \
+    --site_stratify --cache_bands --nan_policy raise \
+    --pretrained_sequence_length ${PRETRAINED_SEQ_LEN}"
+# ABIDE has 17 sites; --leave_one_site_out NYU answers "does it transfer to an
+# unseen scanner", which a stratified split does not.
+
 # ── Environment ──────────────────────────────────────────────────────────────
 source /usr/anaconda3/etc/profile.d/conda.sh
 conda activate mbbn
@@ -53,4 +66,5 @@ python main.py \
     --batch_size_phase2 16 \
     --lr_init_phase2 3e-5 \
     --seed ${SEED} \
-    --exp_name ${EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    ${HARDENING}
