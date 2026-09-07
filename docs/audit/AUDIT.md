@@ -384,7 +384,7 @@ without any corresponding property of the data.
 
 *Consequence:* Identical work is repeated every epoch. Measured per subject: 273.8 ms at ABIDE's 360x280 (the Minuit fit converges slowly at 280 samples), 12.3 ms at ABCD 360x348, 16.1 ms at UKB 400x464.
 
-*Fix:* --cache_bands memoises the decomposition to disk, keyed on dataset/subject/seq_len/TR/filter (427x / 16x / 18x per subject). Opt-in, and deliberately not the default: the per-subject ratio is large but the absolute saving is not, because the work is spread over 8 DataLoader workers and the cohorts are small in aggregate. Over the scripted epoch counts it saves 0.07 wall-hours on ABIDE (0.34 GB cache), 0.37 h on ABCD (27 GB) and 9.1 h on UKB pretraining (181 GB). It pays off for repeated runs over the same subjects -- sweeps, seed replicates, debugging -- not for a single training run. Flag: `--cache_bands`.
+*Fix:* --cache_bands memoises the decomposition to disk, keyed on dataset/subject/seq_len/TR/filter (427x / 16x / 18x per subject). Opt-in, and deliberately not the default: the per-subject ratio is large but the absolute saving is modest, because the work is spread over 8 DataLoader workers. Over the epoch counts the launch scripts set it saves 0.07 wall-hours on ABIDE (0.34 GB cache), 0.37 h on ABCD (27 GB) and 23 h on the 1000-epoch Schaefer-400 UKB pretraining run (181 GB). Worth it for long pretraining and for repeated passes over the same subjects (sweeps, seed replicates); not for a single fine-tuning run. Flag: `--cache_bands`.
 
 *Evidence:* measured
 
@@ -565,20 +565,23 @@ The ABIDE configuration is ~20x more expensive per subject than the longer serie
 the Minuit `f2` fit converges slowly at 280 samples.
 
 Projected over the cohort sizes in this repository's own README (UKB 40,699 + ABCD 8,833 +
-ABIDE 141 = 49,673, matching the total stated in the paper abstract) and the epoch counts in
-the launch scripts, dividing the serial cost by the 8-worker `DataLoader` cap:
+ABIDE 141 = 49,673, matching the total stated in the paper abstract) and the epoch counts
+the launch scripts set, dividing the serial cost by the 8-worker `DataLoader` cap. Note that
+`pretrain_MBBN.slurm` sets `N_EPOCHS=1000` for the Schaefer-400 configuration — the one
+benchmarked here — and 400 for its 360-ROI variant:
 
-| cohort | N | epochs | cache saves | cache size |
-|---|---|---|---|---|
-| ABIDE (`finetune_MBBN.slurm`) | 141 | 50 | 0.07 wall-h | 0.34 GB |
-| ABCD (`train_MBBN_from_scratch.slurm`) | 8,833 | 100 | 0.37 wall-h | 26.57 GB |
-| UKB (`pretrain_MBBN.slurm`) | 40,699 | 400 | 9.09 wall-h | 181.34 GB |
+| cohort | N | epochs | configuration | cache saves | cache size |
+|---|---|---|---|---|---|
+| ABIDE (`finetune_MBBN.slurm`) | 141 | 50 | HCP-MMP1 360, nEpochs_phase2 50 | 0.07 wall-h | 0.34 GB |
+| ABCD (`train_MBBN_from_scratch.slurm`) | 8,833 | 100 | HCP-MMP1 360, nEpochs_phase2 100 | 0.37 wall-h | 26.57 GB |
+| UKB (`pretrain_MBBN.slurm`) | 40,699 | 1000 | Schaefer 400, N_EPOCHS=1000 (the 360-ROI variant is 400) | 22.76 wall-h | 181.34 GB |
 
-**Honest verdict: the per-subject ratio is large but the absolute saving is not.** The work
-is spread over 8 workers and the cohorts are small in aggregate, so even UKB pretraining —
-400 epochs over 40,699 subjects — recovers about 9 wall-hours for a 181 GB cache. This is
-why `--cache_bands` is opt-in. It earns its keep for *repeated* passes over the same
-subjects (hyperparameter sweeps, seed replicates, debugging), not for a single training run.
+**Honest verdict: the per-subject ratio is large but the absolute saving is modest.** The
+work is spread over 8 workers, so ABIDE fine-tuning recovers minutes and ABCD under an
+hour; only the 1000-epoch UKB pretraining run is material at 23 wall-hours, and it costs a 181 GB cache.
+`--cache_bands` is therefore opt-in: worth enabling for long pretraining and for repeated
+passes over the same subjects (hyperparameter sweeps, seed replicates, debugging), not for
+a single fine-tuning run.
 
 ## Cohort-dependent consequences of the evaluation defects
 
