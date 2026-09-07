@@ -42,9 +42,11 @@ about the paper's reported accuracy. Specifically:
   improve AUROC. Where a change should help, the reasoning is stated as a mechanism, not
   as a measured improvement.
 - Quantities that depend on cohort size (how many subjects a dropped batch discards, how
-  much the band cache saves) are reported either as formulas or against the single cohort
-  figure the paper states (49,673 individuals in total). Per-cohort subject counts are not
-  recorded in the repository.
+  much the band cache saves) are computed from the cohort sizes this repository's own
+  README tabulates — UKB 40,699, ABCD 8,833, ABIDE 141, summing to the 49,673 the paper
+  states — paired with the epoch counts in the launch scripts. Those N are the released
+  documentation's figures, not counts verified against the cohorts themselves, and the
+  split sizes follow from applying the released `train_test_split` calls to them.
 - Measurements on synthetic data (D12, D13, D17, D29) demonstrate the *mechanism* and its
   magnitude under stated conditions. They are not estimates of the effect on the paper's
   numbers.
